@@ -613,6 +613,14 @@ VoidResult registerEntryPoints(CodegenContext& ctx) {
 
       exInfo = parseExceptionInfo(binary, beginAddr);
       if (exInfo) {
+        // maxAddress comes from a FuncInfo shared by a function's funclets and can reach 
+        // into the parent, so clamp it to the next function.
+        if (i + 1 < count) {
+          uint32_t nextBeginAddr = byte_swap(entries[i + 1].BeginAddress);
+          if (exInfo->maxAddress > nextBeginAddr - 4) {
+            exInfo->maxAddress = nextBeginAddr - 4;
+          }
+        }
         if (exInfo->maxAddress > beginAddr + size) {
           size = exInfo->maxAddress - beginAddr + 4;
         }
