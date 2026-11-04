@@ -168,17 +168,18 @@ bool build_bctr(BuilderContext& ctx) {
     }
 
     // Unreachable while the recovered table covers the guard's range; reaching it means the
-    // table came out short. bctr / reg / ctr identify it, which is enough for a script to
-    // locate the table in the image, rebuild every label and write a [[switch_tables]] entry
-    // (address / register / labels). A manual table is authoritative over auto-detection,
-    // so that entry is the fix.
+    // table came out short. table is the entry-0 address (0 when the table came from the
+    // manifest) and maxcase the last case index already emitted, so a script can rescan from
+    // the start, extend past maxcase and write the whole table as a [[switch_tables]] entry
+    // (address / register / labels). A manual table is authoritative over auto-detection, so
+    // that entry is the fix.
     ctx.println("\tdefault:");
     ctx.println(
-        "\t\tREX_FATAL(\"SWITCH_MISS bctr=0x{{:08X}} index={{}} cases={{}}"
-        " table=0x{{:08X}} ctr=0x{{:08X}} reg={{}}\","
-        " 0x{:08X}u, {}.u32, {}, 0x{:08X}u, ctx.ctr.u32, {});",
-        ctx.base, ctx.r(jt->indexRegister), jt->targets.size(), jt->tableAddress,
-        static_cast<unsigned>(jt->indexRegister));
+      "\t\tREX_FATAL(\"SWITCH_MISS bctr=0x{{:08X}} index={{}} maxcase={{}}"
+      " table=0x{{:08X}} ctr=0x{{:08X}} reg={{}}\","
+      " 0x{:08X}u, {}.u32, {}, 0x{:08X}u, ctx.ctr.u32, {});",
+      ctx.base, ctx.r(jt->indexRegister), jt->targets.size() - 1, jt->tableAddress,
+      static_cast<unsigned>(jt->indexRegister));
     ctx.println("\t}}");
 
     ctx.reset_switch_table();
