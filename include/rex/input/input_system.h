@@ -11,6 +11,7 @@
  */
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include <rex/input/device_assignment.h>
@@ -60,6 +61,17 @@ class InputSystem : public system::IInputSystem {
 
   std::unique_ptr<DeviceAssignment> assignment_;
   ActiveDeviceTracker active_devices_;
+
+  // Guards devices_ and device_owners_. The guest XInput entry points are
+  // called from several guest threads at once, and RefreshDevices rebuilds
+  // both vectors underneath them.
+  //
+  // Contract: the lock is taken once per public entry point (GetCapabilities,
+  // GetState, SetState, GetKeystroke, Shutdown, SetDeviceAssignment) and held
+  // for the whole body. RefreshDevices, DriverForDevice and DeviceInfoFor do
+  // not lock; they require the caller to hold it. Recursive so an entry point
+  // can reach another one without deadlocking.
+  mutable std::recursive_mutex devices_mutex_;
 
   // Ordered by ordinal. Ordinals are never recycled, so unplugging pad one
   // does not renumber pad two.
