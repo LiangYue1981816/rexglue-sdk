@@ -413,12 +413,20 @@ constexpr uint32_t kEdramTileHeightSamples = 16;
 constexpr uint32_t kEdramTileCount = 2048;
 constexpr uint32_t kEdramSizeBytes =
     kEdramTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
+// Gears of War 2 at widths above 1280 sets 12-bit render target bases (bit 11 set) for its half-resolution
+// passes, which need more than the 10 MB: the pixel shader interlock path emulates 4096 tiles so those targets
+// do not wrap onto the scene depth. See sdk/patches/0021.
+constexpr uint32_t kEdramVirtualTileCount = kEdramTileCount * 2;
 
 // RB_SURFACE_INFO::surface_pitch width.
 constexpr uint32_t kEdramPitchPixelsBits = 14;
 // The part of RB_COLOR_INFO::color_base and RB_DEPTH_INFO::depth_base width
 // usable on the Xenos, which has periodic 11-bit EDRAM tile addressing.
 constexpr uint32_t kEdramBaseTilesBits = 11;
+// color_base / depth_base with color_base_bit_11 / depth_base_bit_11, addressing
+// kEdramVirtualTileCount tiles (gpu_native_surfaces on the host render target path).
+constexpr uint32_t kEdramVirtualBaseTilesBits = kEdramBaseTilesBits + 1;
+static_assert((uint32_t(1) << kEdramVirtualBaseTilesBits) == kEdramVirtualTileCount);
 
 constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels, MsaaSamples msaa_samples,
                                         bool is_64bpp) {

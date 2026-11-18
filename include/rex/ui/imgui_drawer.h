@@ -84,6 +84,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   void ClearInput();
   void OnKey(KeyEvent& e, bool is_down);
   void UpdateMousePosition(float x, float y);
+#if REX_PLATFORM_ANDROID
+  void ReleaseDeferredTouch(ImGuiIO& io);
+#endif
   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
 
   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
@@ -123,6 +126,12 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   // reset (for instance, after releasing a touch), so it's not hovering over
   // anything.
   bool reset_mouse_position_after_next_frame_ = false;
+#if REX_PLATFORM_ANDROID
+  // A tap whose lift arrives before any frame saw the press is released after the next frame, so
+  // ImGui sees a click instead of nothing (the UI thread can hand over both in one go).
+  bool touch_press_unseen_ = false;
+  bool touch_release_deferred_ = false;
+#endif
 
   double frame_time_tick_frequency_;
   uint64_t last_frame_time_ticks_;

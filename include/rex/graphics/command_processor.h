@@ -115,6 +115,9 @@ class CommandProcessor {
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
 
+  virtual void InitializeTextureReplacement(const std::filesystem::path& cache_root,
+                                            uint32_t title_id) {}
+
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
 

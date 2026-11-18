@@ -36,6 +36,8 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
   ID3D12PipelineState* current_pipeline_state = nullptr;
+  ID3D12DescriptorHeap* current_heaps[2] = {};
+  UINT current_heap_count = 0;
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -229,6 +231,8 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
           descriptor_heaps[num_descriptor_heaps++] = args.sampler_descriptor_heap;
         }
         command_list->SetDescriptorHeaps(num_descriptor_heaps, descriptor_heaps);
+        current_heap_count = num_descriptor_heaps;
+        std::memcpy(current_heaps, descriptor_heaps, sizeof(current_heaps));
       } break;
       case Command::kD3DSetPipelineState: {
         current_pipeline_state = *reinterpret_cast<ID3D12PipelineState* const*>(stream);
@@ -261,6 +265,13 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
       } break;
       case Command::kEndDebugMarker: {
         command_list->EndEvent();
+      } break;
+      case Command::kCallback: {
+        auto& args = *reinterpret_cast<const CallbackArguments*>(stream);
+        args.fn(command_list, args.user);
+        // The callback may have bound other descriptor heaps or pipelines.
+        if (current_heap_count) command_list->SetDescriptorHeaps(current_heap_count, current_heaps);
+        current_pipeline_state = nullptr;
       } break;
       case Command::kInsertDebugMarker: {
         auto& args = *reinterpret_cast<const DebugMarkerHeader*>(stream);

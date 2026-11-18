@@ -8,9 +8,12 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <rex/cvar.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
+
+REXCVAR_DECLARE(bool, system_link_trace);  // defined in xam_net.cpp
 
 // kinda gross but oh well
 REX_EXPORT_STUB(__imp__CancelWaitableTimer);
@@ -243,7 +246,21 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
 REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
 REX_EXPORT_STUB(__imp__XNetLogonGetState);
 REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
+// M1: GOW2 imports this stub; REX_EXPORT_STUB leaves r3 untouched (undefined
+// return). This returns a title ID rather than a status, so 0 (no title) is the
+// defined safe value. Once-only [netlink] line when system_link_trace is on.
+extern "C" REX_FUNC(__imp__XNetLogonGetTitleID) {
+  (void)base;
+  REXKRNL_WARN("__imp__XNetLogonGetTitleID STUB - returning 0 (no title)");
+  static bool netlink_stub_logged = false;
+  if (!netlink_stub_logged && REXCVAR_GET(system_link_trace)) {
+    netlink_stub_logged = true;
+    REXLOG_INFO("[netlink] stub __imp__XNetLogonGetTitleID returning 0 (unimplemented)");
+  }
+  ctx.r3.u64 = 0;
+}
+static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XNetLogonGetTitleID(
+    "__imp__XNetLogonGetTitleID", &__imp__XNetLogonGetTitleID);
 REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
 REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
 REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);

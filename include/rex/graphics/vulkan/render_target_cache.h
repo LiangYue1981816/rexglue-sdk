@@ -11,10 +11,12 @@
  */
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <string>
 #include <unordered_map>
 
 #include <rex/graphics/flags.h>
@@ -392,14 +394,15 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
 
     // Same as RenderTargetKey::pitch_tiles_at_32bpp.
     uint32_t pitch_tiles_at_32bpp : 8;  // 8
-    // [0, 2047].
-    uint32_t depth_base_tiles : xenos::kEdramBaseTilesBits;    // 19
-    uint32_t color_0_base_tiles : xenos::kEdramBaseTilesBits;  // 30
+    // Same as RenderTargetKey::base_tiles: [0, 2047], or [0, 4095] with
+    // gpu_native_surfaces - render targets 2048 tiles apart are different.
+    uint32_t depth_base_tiles : xenos::kEdramVirtualBaseTilesBits;    // 20
+    uint32_t color_0_base_tiles : xenos::kEdramVirtualBaseTilesBits;  // 32
 
-    uint32_t color_1_base_tiles : xenos::kEdramBaseTilesBits;  // 43
-    uint32_t color_2_base_tiles : xenos::kEdramBaseTilesBits;  // 54
+    uint32_t color_1_base_tiles : xenos::kEdramVirtualBaseTilesBits;  // 44
+    uint32_t color_2_base_tiles : xenos::kEdramVirtualBaseTilesBits;  // 56
 
-    uint32_t color_3_base_tiles : xenos::kEdramBaseTilesBits;  // 75
+    uint32_t color_3_base_tiles : xenos::kEdramVirtualBaseTilesBits;  // 76
 
     // Including all the padding, for a stable hash.
     FramebufferKey() { Reset(); }
@@ -590,6 +593,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       // + 1 bit because this is a signed difference between two EDRAM bases.
       // 0 for host_depth_source_is_copy (ignored in this case anyway as
       // destination == source anyway).
+      // Not widened for 12-bit bases (gpu_native_surfaces) - the fields fill
+      // all 32 bits. The truncated difference is the same modulo
+      // xenos::kEdramTileCount, which the shader wraps the source tile index
+      // to; RenderTargetCache::DropNativeWideTransfers removes the transfers
+      // for which that wrapping is wrong.
       int32_t source_to_dest : xenos::kEdramBaseTilesBits + 1;
     };
     TransferAddressConstant() : constant(0) { static_assert_size(*this, sizeof(constant)); }
@@ -694,9 +702,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
     uint32_t offsets;
     struct {
       // May be beyond the EDRAM tile count in case of EDRAM addressing
-      // wrapping, thus + 1 bit.
-      uint32_t dispatch_first_tile : xenos::kEdramBaseTilesBits + 1;
-      uint32_t source_base_tiles : xenos::kEdramBaseTilesBits;
+      // wrapping, thus + 1 bit. Both are in the ownership map's address space,
+      // with 12-bit render target bases with gpu_native_surfaces; the dump
+      // shader wraps the EDRAM buffer address to xenos::kEdramTileCount.
+      uint32_t dispatch_first_tile : xenos::kEdramVirtualBaseTilesBits + 1;
+      uint32_t source_base_tiles : xenos::kEdramVirtualBaseTilesBits;
     };
     DumpOffsets() : offsets(0) { static_assert_size(*this, sizeof(offsets)); }
     bool operator==(const DumpOffsets& other_offsets) const {
@@ -799,6 +809,16 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
       const std::vector<Transfer>* render_target_transfers,
       const uint64_t* render_target_resolve_clear_values = nullptr,
       const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+#if REX_PLATFORM_ANDROID
+  // FRAMETRACE-RT lines of the traced frame (vulkan_android_trace_frame_after_seconds).
+  static std::string DescribeAndroidRenderTarget(const RenderTarget* render_target);
+  void TraceAndroidTransfersAndResolveClears(uint32_t render_target_count,
+                                             RenderTarget* const* render_targets,
+                                             const std::vector<Transfer>* render_target_transfers,
+                                             const uint64_t* render_target_resolve_clear_values,
+                                             const Transfer::Rectangle* resolve_clear_rectangle);
+  void TraceAndroidResolve(const draw_util::ResolveInfo& resolve_info) const;
+#endif
 
   VkPipeline GetDumpPipeline(DumpPipelineKey key);
   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
@@ -810,6 +830,71 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   // ResolveInfo::GetCopyEdramTileSpan to edram_buffer_.
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
+
+  // gpu_native_resolves: why a resolve or a texture was not written natively. The names up to
+  // kDescriptors are the D3D12RenderTargetCache ones.
+  enum class NativeResolveFallback : uint32_t {
+    kDepth,
+    kMsaa,
+    kExpBias,
+    kSwap,
+    kNoSource,
+    kMultipleSources,
+    kPartialSource,
+    kSourceFormat,
+    kDestFormat,
+    kDestArray,
+    kDestBaseAdjusted,
+    kEndian,
+    kHalfPixelFill,
+    kSourcePlacement,
+    kTextureIncompatible,
+    kTextureNotUpToDate,
+    kTextureReplacement,
+    kTextureOutside,
+    // The texture was created without VK_IMAGE_USAGE_STORAGE_BIT.
+    kTextureNoUAV,
+    kNoPipeline,
+    kDescriptors,
+    // The device doesn't support storage images of the texture format.
+    kTextureNoStorageFormat,
+    // Failed to create the storage view of the texture.
+    kImageView,
+    // vkCmdCopyImage: the VkFormat of the texture is not the one of the render target.
+    kCopyFormat,
+    kCount,
+  };
+  static const char* const kNativeResolveFallbackNames[size_t(NativeResolveFallback::kCount)];
+  // gpu_native_resolves: the source render target and destination texture formats written.
+  enum class NativeResolvePair : uint32_t {
+    // Color k_16_16_16_16_FLOAT to k_16_16_16_16_FLOAT, copied or scaled by the exponent bias.
+    k16161616Float,
+    // Color k_16_16_FLOAT to k_16_16_FLOAT, copied.
+    k1616Float,
+    // Color k_2_10_10_10_FLOAT to k_16_16_16_16_FLOAT, scaled by the exponent bias.
+    k2101010FloatTo16161616Float,
+    // Color k_8_8_8_8 to k_8_8_8_8, copied or with red and blue swapped.
+    k8888,
+    // Depth kD24S8 to k_24_8.
+    kD24S8,
+    // Depth kD24FS8 to k_24_8_FLOAT.
+    kD24FS8,
+    kCount,
+  };
+  static const char* const kNativeResolvePairNames[size_t(NativeResolvePair::kCount)];
+  // Whether a host render target resolve copy may be written to the textures natively, counting
+  // the reason if not.
+  bool IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info);
+  // After DumpRenderTargets and MarkRangeAsResolved for the resolve, copies the resolved region
+  // from the source host render target into the texture cache textures viewing the destination
+  // that were up to date before the resolve, and marks them up to date.
+  void WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+                              VulkanTextureCache& texture_cache);
+  void CountNativeResolveFallback(NativeResolveFallback reason, uint64_t count = 1) {
+    native_resolve_fallbacks_[size_t(reason)] += count;
+  }
+  // Logs the native resolve counts every few seconds.
+  void ReportNativeResolves();
 
   bool gamma_render_target_as_unorm16_ = false;
 
@@ -870,6 +955,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // gpu_native_resolves: textures written and fallbacks since the last report.
+  uint64_t native_resolve_written_ = 0;
+  std::array<uint64_t, size_t(NativeResolvePair::kCount)> native_resolve_written_pairs_ = {};
+  std::array<uint64_t, size_t(NativeResolveFallback::kCount)> native_resolve_fallbacks_ = {};
+  std::chrono::steady_clock::time_point native_resolve_last_report_ =
+      std::chrono::steady_clock::now();
 
   // For pixel (fragment) shader interlock.
 

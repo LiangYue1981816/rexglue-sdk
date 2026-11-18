@@ -12,13 +12,16 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
 #include <cstring>
+#include <span>
 
 #if REX_PLATFORM_MAC
 #include <sys/select.h>
 #endif
 
 #include <rex/chrono/clock.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/module.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/kernel/xboxkrnl/error.h>
@@ -28,6 +31,7 @@
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/system_link.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xsocket.h>
 #include <rex/system/xthread.h>
@@ -42,13 +46,63 @@
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <sys/socket.h>
+
+#include <cerrno>
 #endif
+
+REXCVAR_DEFINE_BOOL(system_link_trace, false, "Network",
+                    "Verbose System Link diagnostics: trace XGI session, XNet and socket calls");
 
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+namespace system_link = rex::system::system_link;
+
+constexpr u32 kWsaENotSock = 0x2736;
+constexpr u32 kWsaEFault = 0x271E;
+constexpr u32 kGuestSockaddrInSize = 16;
+
+// M0 diagnostics for System Link (gated by system_link_trace, default off).
+// All helpers below are read-only: they never write guest buffers/registers.
+
+// Rate limiter: log the first 50 calls per call site, then every 500th, so
+// packet loops (sendto/recvfrom) cannot flood the log.
+static bool NetLinkTraceAllow(std::atomic<uint64_t>* counter) {
+  uint64_t n = counter->fetch_add(1, std::memory_order_relaxed) + 1;
+  return n <= 50 || (n % 500) == 0;
+}
+
+// Split a guest AF_INET sockaddr (big-endian fields) into host-order parts.
+// Null-safe; yields 0.0.0.0:0 for a null pointer.
+static void NetLinkSplitAddrIn(ppc_ptr_t<XSOCKADDR_IN> addr, uint32_t* ip_host_out,
+                               uint16_t* port_host_out) {
+  if (!addr) {
+    *ip_host_out = 0;
+    *port_host_out = 0;
+    return;
+  }
+  *ip_host_out = addr->sin_addr;
+  *port_host_out = addr->sin_port;
+}
+
+// Split a generic guest sockaddr when it carries AF_INET (family + port/addr
+// in the first 6 sa_data bytes). Yields 0.0.0.0:0 otherwise.
+static void NetLinkSplitAddr(ppc_ptr_t<XSOCKADDR> addr, uint32_t addr_len, uint32_t* ip_host_out,
+                             uint16_t* port_host_out) {
+  *ip_host_out = 0;
+  *port_host_out = 0;
+  if (!addr || addr_len < 8 || addr->address_family != AF_INET) {
+    return;
+  }
+  uint16_t port_be;
+  uint32_t ip_be;
+  std::memcpy(&port_be, addr->sa_data, sizeof(port_be));
+  std::memcpy(&ip_be, addr->sa_data + 2, sizeof(ip_be));
+  *port_host_out = rex::byte_swap(port_be);
+  *ip_host_out = rex::byte_swap(ip_be);
+}
 
 // https://github.com/G91/TitanOffLine/blob/1e692d9bb9dfac386d08045ccdadf4ae3227bb5e/xkelib/xam/xamNet.h
 enum {
@@ -199,6 +253,13 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
   }
   */
 
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetStartup caller={} params={:#010x} ret=0", caller,
+                params ? params.guest_address() : 0);
+  }
+
+  system_link::StartPeerResolver();
   return 0;
 }
 
@@ -231,10 +292,9 @@ u32 NetDll_XNetGetOpt_entry(u32 one, u32 option_id, mapped_void buffer_ptr,
 }
 
 u32 NetDll_XNetRandom_entry(u32 caller, mapped_void buffer_ptr, u32 length) {
-  // For now, constant values.
-  // This makes replicating things easier.
-  std::memset(buffer_ptr, 0xBB, length);
-
+  if (buffer_ptr) {
+    system_link::FillRandom(std::span(static_cast<uint8_t*>(buffer_ptr), length));
+  }
   return 0;
 }
 
@@ -283,6 +343,12 @@ u32 NetDll_WSAStartup_entry(u32 caller, u16 version, ppc_ptr_t<X_WSADATA> data_p
   }
   */
 
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] WSAStartup caller={} version={:#06x} ret={}", caller, version, ret);
+  }
+
+  system_link::StartPeerResolver();
   return ret;
 }
 
@@ -420,7 +486,7 @@ struct XnAddrStatus {
   // Host has ethernet address (no IP address)
   static const uint32_t XNET_GET_XNADDR_ETHERNET = 0x00000002;
   // Host has statically assigned IP address
-  static const uint32_t XNET_GET_XNADDR_STATIC = 0x00000004;
+  static constexpr uint32_t XNET_GET_XNADDR_STATIC = 0x00000004;
   // Host has DHCP assigned IP address
   static const uint32_t XNET_GET_XNADDR_DHCP = 0x00000008;
   // Host has PPPoE assigned IP address
@@ -435,26 +501,48 @@ struct XnAddrStatus {
   static const uint32_t XNET_GET_XNADDR_TROUBLESHOOT = 0x00008000;
 };
 
+#if REX_PLATFORM_ANDROID
+// Out-of-line definitions for the status constants above. They are declared
+// static const (not constexpr), so any odr-use — e.g. binding one to the
+// const& parameter of the logging layer, as NetDll_XNetGetTitleXnAddr_entry
+// does — requires a definition at namespace scope. The desktop toolchains
+// happen to fold the value uses they see, but bionic/Clang keeps the
+// reference, hence the undefined symbol at link time. Android-only so desktop
+// builds are unchanged.
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_PENDING;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_NONE;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_ETHERNET;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_STATIC;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_DHCP;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_PPPOE;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_GATEWAY;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_DNS;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_ONLINE;
+const uint32_t XnAddrStatus::XNET_GET_XNADDR_TROUBLESHOOT;
+#endif  // REX_PLATFORM_ANDROID
+
 u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
-  // Just return a loopback address atm.
-  addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
-  addr_ptr->inaOnline.s_addr = 0;
-  addr_ptr->wPortOnline = 0;
+  static_assert(sizeof(XNADDR) == system_link::kXnAddrSize);
+  // RakNet's 360 version (58411436) derives "random" numbers from abEnet and fails on a zero MAC,
+  // so the MAC is a non-zero, locally administered address unique per instance.
+  auto xnaddr = system_link::TitleXnAddr(REX_KERNEL_STATE()->user_profile()->network_xuid());
+  std::memcpy(static_cast<XNADDR*>(addr_ptr), xnaddr.data(), xnaddr.size());
 
-  // TODO(gibbed): A proper mac address.
-  // RakNet's 360 version appears to depend on abEnet to create "random" 64-bit
-  // numbers. A zero value will cause RakPeer::Startup to fail. This causes
-  // 58411436 to crash on startup.
-  // The 360-specific code is scrubbed from the RakNet repo, but there's still
-  // traces of what it's doing which match the game code.
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L382
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4527
-  // https://github.com/facebookarchive/RakNet/blob/master/Source/RakPeer.cpp#L4467
-  // "Mac address is a poor solution because you can't have multiple connections
-  // from the same system"
-  std::memset(addr_ptr->abEnet, 0xCC, 6);
-
-  std::memset(addr_ptr->abOnline, 0, 20);
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    uint32_t trace_ip = rex::byte_swap(static_cast<uint32_t>(addr_ptr->ina.s_addr));
+    uint32_t trace_online_ip =
+        rex::byte_swap(static_cast<uint32_t>(addr_ptr->inaOnline.s_addr));
+    uint16_t trace_online_port = addr_ptr->wPortOnline;
+    REXLOG_INFO(
+        "[netlink] XNetGetTitleXnAddr caller={} ret={:#x} ina={}.{}.{}.{} inaOnline={} "
+        "portOnline={} mac={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        caller, XnAddrStatus::XNET_GET_XNADDR_STATIC, (trace_ip >> 24) & 0xFF,
+        (trace_ip >> 16) & 0xFF, (trace_ip >> 8) & 0xFF, trace_ip & 0xFF,
+        system_link::FormatIpv4(trace_online_ip), trace_online_port, addr_ptr->abEnet[0],
+        addr_ptr->abEnet[1], addr_ptr->abEnet[2], addr_ptr->abEnet[3], addr_ptr->abEnet[4],
+        addr_ptr->abEnet[5]);
+  }
 
   return XnAddrStatus::XNET_GET_XNADDR_STATIC;
 }
@@ -478,15 +566,48 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
 
 // This converts a XNet address to an IN_ADDR. The IN_ADDR is used for
 // subsequent socket calls (like a handle to a XNet address)
+// PeerInAddr picks the reachable address for this peer (LAN vs online).
 u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
                                     mapped_void in_addr) {
-  return 1;
+  constexpr u32 kWsaEInval = 0x2726;
+  u32 result = kWsaEInval;
+  uint32_t ina = 0;
+  uint32_t ina_online = 0;
+  uint32_t target = 0;
+  if (xn_addr && in_addr) {
+    ina = rex::byte_swap(static_cast<uint32_t>(xn_addr->ina.s_addr));
+    ina_online = rex::byte_swap(static_cast<uint32_t>(xn_addr->inaOnline.s_addr));
+    target = system_link::PeerInAddr(ina, ina_online, system_link::LocalSubnet(),
+                                     system_link::HeardFromRecently(ina));
+    uint32_t target_raw = rex::byte_swap(target);
+    std::memcpy(static_cast<uint8_t*>(in_addr), &target_raw, sizeof(target_raw));
+    result = 0;
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetXnAddrToInAddr caller={} ina={} inaOnline={} -> {} ret={:#x}", caller,
+                system_link::FormatIpv4(ina), system_link::FormatIpv4(ina_online),
+                system_link::FormatIpv4(target), result);
+  }
+  return result;
 }
 
 // Does the reverse of the above.
 // FIXME: Arguments may not be correct.
 u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
                                     mapped_void xid) {
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    uint32_t trace_ip = 0;
+    if (in_addr) {
+      uint32_t raw;
+      std::memcpy(&raw, static_cast<uint8_t*>(in_addr), sizeof(raw));
+      trace_ip = rex::byte_swap(raw);
+    }
+    REXLOG_INFO("[netlink] XNetInAddrToXnAddr caller={} in_addr={}.{}.{}.{} ret=1", caller,
+                (trace_ip >> 24) & 0xFF, (trace_ip >> 16) & 0xFF, (trace_ip >> 8) & 0xFF,
+                trace_ip & 0xFF);
+  }
   return 1;
 }
 
@@ -506,6 +627,35 @@ struct XEthernetStatus {
 };
 
 u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
+  uint32_t status = system_link::EthernetLinkStatus();
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetGetEthernetLinkStatus caller={} ret={:#x}", caller, status);
+  }
+  return status;
+}
+
+u32 NetDll_XNetRegisterKey_entry(u32 caller, mapped_void xnkid, mapped_void xnkey) {
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetRegisterKey caller={} ret=0", caller);
+  }
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterKey_entry(u32 caller, mapped_void xnkid) {
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetUnregisterKey caller={} ret=0", caller);
+  }
+  return 0;
+}
+
+u32 NetDll_XNetUnregisterInAddr_entry(u32 caller, u32 in_addr) {
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetUnregisterInAddr caller={} ret=0", caller);
+  }
   return 0;
 }
 
@@ -559,6 +709,11 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
 
 u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
                                u32 flags) {
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] XNetQosListen caller={} data_size={} flags={:#010x} ret={:#x}", caller,
+                data_size, flags, X_ERROR_FUNCTION_FAILED);
+  }
   return X_ERROR_FUNCTION_FAILED;
 }
 
@@ -589,7 +744,18 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
 
     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
     XThread::SetLastError(error);
+    static std::atomic<uint64_t> netlink_trace_fail_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_fail_count)) {
+      REXLOG_INFO("[netlink] socket af={} type={} proto={} ret=-1 error={:#x}", af, type, protocol,
+                  error);
+    }
     return -1;
+  }
+
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] socket af={} type={} proto={} ret={:#010x}", af, type, protocol,
+                socket->handle());
   }
 
   return socket->handle();
@@ -620,12 +786,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
 
   auto ret = socket->Shutdown(how);
   if (ret == -1) {
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
+    XThread::SetLastError(XSocket::LastHostError());
   }
   return ret;
 }
@@ -636,11 +797,113 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] setsockopt s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
     return -1;
   }
 
   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
+  if (XFAILED(status)) {
+    XThread::SetLastError(XSocket::LastHostError());
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    uint32_t trace_value = 0;
+    if (optval_ptr && optlen >= 4) {
+      uint32_t raw;
+      std::memcpy(&raw, static_cast<uint8_t*>(optval_ptr), sizeof(raw));
+      trace_value = rex::byte_swap(raw);  // guest integers are big-endian
+    }
+    REXLOG_INFO("[netlink] setsockopt s={:#010x} level={:#x} opt={:#x} optlen={} value={:#x} ret={}",
+                socket_handle, level, optname, optlen, trace_value,
+                XSUCCEEDED(status) ? 0 : -1);
+  }
   return XSUCCEEDED(status) ? 0 : -1;
+}
+
+// M1: getsockopt for the common SOL_SOCKET integer options (SO_BROADCAST,
+// SO_RCVBUF, SO_SNDBUF, SO_ERROR, SO_TYPE), forwarded to the host socket like
+// setsockopt above. Integer values are big-endian on the guest, so the host
+// result is byte-swapped on the way back.
+u32 NetDll_getsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                            mapped_void optval_ptr, mapped_u32 optlen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  if (!socket) {
+    // WSAENOTSOCK
+    XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] getsockopt s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
+    return -1;
+  }
+  if (!optval_ptr || !optlen_ptr) {
+    // WSAEFAULT
+    XThread::SetLastError(0x271E);
+    return -1;
+  }
+
+  int host_level = static_cast<int>(level);
+  int host_optname = static_cast<int>(optname);
+  XSocket::NativeSocketOption(level, optname, &host_level, &host_optname);
+
+  // *optlen_ptr is big-endian on the guest; MappedPtr converts on access.
+  int host_len = static_cast<int>(optlen_ptr.value());
+  uint8_t host_buf[128];
+  if (host_len < 0) {
+    host_len = 0;
+  }
+  if (host_len > static_cast<int>(sizeof(host_buf))) {
+    host_len = static_cast<int>(sizeof(host_buf));
+  }
+
+#if REX_PLATFORM_WIN32
+  int ret = ::getsockopt(static_cast<SOCKET>(socket->native_handle()), host_level, host_optname,
+                         reinterpret_cast<char*>(host_buf), &host_len);
+#else
+  socklen_t optlen_native = static_cast<socklen_t>(host_len);
+  int ret = ::getsockopt(static_cast<int>(socket->native_handle()), host_level, host_optname,
+                         reinterpret_cast<char*>(host_buf), &optlen_native);
+  host_len = static_cast<int>(optlen_native);
+#endif
+
+  uint32_t trace_value = 0;
+  bool trace_have_value = false;
+  u32 result;
+  if (ret != 0) {
+#if REX_PLATFORM_WIN32
+    XThread::SetLastError(WSAGetLastError());
+#else
+    XThread::SetLastError(system_link::WsaErrorFromErrno(errno));
+#endif
+    result = static_cast<u32>(-1);
+  } else {
+    bool is_int_opt = (level == 0xFFFF) && (optname == 0x0020 || optname == 0x1001 ||
+                                            optname == 0x1002 || optname == 0x1007 ||
+                                            optname == 0x1008);
+    if (is_int_opt && host_len == 4) {
+      uint32_t host_value;
+      std::memcpy(&host_value, host_buf, sizeof(host_value));
+      memory::store_and_swap<uint32_t>(static_cast<uint8_t*>(optval_ptr), host_value);
+      trace_value = host_value;
+      trace_have_value = true;
+    } else {
+      std::memcpy(static_cast<uint8_t*>(optval_ptr), host_buf, host_len);
+    }
+    *optlen_ptr = static_cast<uint32_t>(host_len);
+    result = 0;
+  }
+
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO(
+        "[netlink] getsockopt s={:#010x} level={:#x} opt={:#x} optlen={} value={} ret={}",
+        socket_handle, level, optname, static_cast<uint32_t>(host_len),
+        trace_have_value ? trace_value : 0, static_cast<int32_t>(result));
+  }
+  return result;
 }
 
 u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
@@ -653,7 +916,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
 
   X_STATUS status = socket->IOControl(cmd, arg_ptr);
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    XThread::SetLastError(XSocket::LastHostError());
     return -1;
   }
 
@@ -666,17 +929,33 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] bind s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
     return -1;
   }
 
   N_XSOCKADDR_IN native_name(name);
   X_STATUS status = socket->Bind(&native_name, namelen);
+  int trace_ret;
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
-    return -1;
+    XThread::SetLastError(XSocket::LastHostError());
+    trace_ret = -1;
+  } else {
+    trace_ret = 0;
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    uint32_t trace_ip;
+    uint16_t trace_port;
+    NetLinkSplitAddrIn(name, &trace_ip, &trace_port);
+    REXLOG_INFO("[netlink] bind s={:#010x} addr={}.{}.{}.{}:{} namelen={} ret={}", socket_handle,
+                (trace_ip >> 24) & 0xFF, (trace_ip >> 16) & 0xFF, (trace_ip >> 8) & 0xFF,
+                trace_ip & 0xFF, trace_port, namelen, trace_ret);
   }
 
-  return 0;
+  return trace_ret;
 }
 
 u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> name, u32 namelen) {
@@ -684,17 +963,33 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] connect s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
     return -1;
   }
 
   N_XSOCKADDR native_name(name);
   X_STATUS status = socket->Connect(&native_name, namelen);
+  int trace_ret;
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
-    return -1;
+    XThread::SetLastError(XSocket::LastHostError());
+    trace_ret = -1;
+  } else {
+    trace_ret = 0;
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    uint32_t trace_ip;
+    uint16_t trace_port;
+    NetLinkSplitAddr(name, namelen, &trace_ip, &trace_port);
+    REXLOG_INFO("[netlink] connect s={:#010x} addr={}.{}.{}.{}:{} namelen={} ret={}",
+                socket_handle, (trace_ip >> 24) & 0xFF, (trace_ip >> 16) & 0xFF,
+                (trace_ip >> 8) & 0xFF, trace_ip & 0xFF, trace_port, namelen, trace_ret);
   }
 
-  return 0;
+  return trace_ret;
 }
 
 u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
@@ -707,7 +1002,7 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
 
   X_STATUS status = socket->Listen(backlog);
   if (XFAILED(status)) {
-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
+    XThread::SetLastError(XSocket::LastHostError());
     return -1;
   }
 
@@ -739,8 +1034,82 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
 
     return new_socket->handle();
   } else {
+    XThread::SetLastError(XSocket::LastHostError());
     return -1;
   }
+}
+
+static void StoreGuestSockaddrIn(ppc_ptr_t<XSOCKADDR_IN> guest, const N_XSOCKADDR_IN& native) {
+  guest->sin_family = native.sin_family;
+  guest->sin_port = native.sin_port;
+  guest->sin_addr = native.sin_addr;
+  std::memset(guest->x_sin_zero, 0, sizeof(guest->x_sin_zero));
+}
+
+u32 NetDll_getsockname_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 namelen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  uint32_t trace_ip = 0;
+  uint16_t trace_port = 0;
+  int trace_ret = -1;
+  u32 result = static_cast<u32>(-1);
+  if (!socket) {
+    XThread::SetLastError(kWsaENotSock);
+  } else if (!name || !namelen_ptr || *namelen_ptr < kGuestSockaddrInSize) {
+    XThread::SetLastError(kWsaEFault);
+  } else {
+    N_XSOCKADDR_IN native_name;
+    int native_len = static_cast<int>(kGuestSockaddrInSize);
+    if (XFAILED(socket->GetSockName(&native_name, &native_len))) {
+      XThread::SetLastError(XSocket::LastHostError());
+    } else {
+      StoreGuestSockaddrIn(name, native_name);
+      *namelen_ptr = kGuestSockaddrInSize;
+      trace_ip = native_name.sin_addr;
+      trace_port = native_name.sin_port;
+      trace_ret = 0;
+      result = 0;
+    }
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] getsockname s={:#010x} addr={}:{} ret={}", socket_handle,
+                system_link::FormatIpv4(trace_ip), trace_port, trace_ret);
+  }
+  return result;
+}
+
+u32 NetDll_getpeername_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name,
+                             mapped_u32 namelen_ptr) {
+  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
+  uint32_t trace_ip = 0;
+  uint16_t trace_port = 0;
+  int trace_ret = -1;
+  u32 result = static_cast<u32>(-1);
+  if (!socket) {
+    XThread::SetLastError(kWsaENotSock);
+  } else if (!name || !namelen_ptr || *namelen_ptr < kGuestSockaddrInSize) {
+    XThread::SetLastError(kWsaEFault);
+  } else {
+    N_XSOCKADDR_IN native_name;
+    int native_len = static_cast<int>(kGuestSockaddrInSize);
+    if (XFAILED(socket->GetPeerName(&native_name, &native_len))) {
+      XThread::SetLastError(XSocket::LastHostError());
+    } else {
+      StoreGuestSockaddrIn(name, native_name);
+      *namelen_ptr = kGuestSockaddrInSize;
+      trace_ip = native_name.sin_addr;
+      trace_port = native_name.sin_port;
+      trace_ret = 0;
+      result = 0;
+    }
+  }
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_count)) {
+    REXLOG_INFO("[netlink] getpeername s={:#010x} addr={}:{} ret={}", socket_handle,
+                system_link::FormatIpv4(trace_ip), trace_port, trace_ret);
+  }
+  return result;
 }
 
 struct x_fd_set {
@@ -796,11 +1165,59 @@ struct host_set {
     }
     this->count = new_count;
   }
+
+  int MaxNativeHandle() const {
+    int max_handle = -1;
+    for (uint32_t i = 0; i < count; ++i) {
+      int handle = static_cast<int>(sockets[i]->native_handle());
+      if (handle > max_handle) {
+        max_handle = handle;
+      }
+    }
+    return max_handle;
+  }
 };
+
+#if !REX_PLATFORM_WIN32
+static int SelectHostNfds(const host_set& read_set, const host_set& write_set,
+                          const host_set& except_set) {
+  int host_nfds = read_set.MaxNativeHandle();
+  int write_max = write_set.MaxNativeHandle();
+  if (write_max > host_nfds) {
+    host_nfds = write_max;
+  }
+  int except_max = except_set.MaxNativeHandle();
+  if (except_max > host_nfds) {
+    host_nfds = except_max;
+  }
+  return host_nfds < 0 ? 0 : host_nfds + 1;
+}
+#endif
 
 i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                         ppc_ptr_t<x_fd_set> writefds, ppc_ptr_t<x_fd_set> exceptfds,
                         mapped_void timeout_ptr) {
+  // Snapshot the requested sets before the call below overwrites them (read-only).
+  const bool trace_link = REXCVAR_GET(system_link_trace);
+  uint32_t trace_rc = 0, trace_wc = 0, trace_ec = 0;
+  bool trace_has_timeout = false;
+  int32_t trace_tv_sec = 0, trace_tv_usec = 0;
+  if (trace_link) {
+    if (readfds) {
+      trace_rc = readfds->fd_count;
+    }
+    if (writefds) {
+      trace_wc = writefds->fd_count;
+    }
+    if (exceptfds) {
+      trace_ec = exceptfds->fd_count;
+    }
+    if (timeout_ptr) {
+      trace_has_timeout = true;
+      trace_tv_sec = static_cast<int32_t>(timeout_ptr.as_array<int32_t>()[0]);
+      trace_tv_usec = static_cast<int32_t>(timeout_ptr.as_array<int32_t>()[1]);
+    }
+  }
   host_set host_readfds = {};
   fd_set native_readfds = {};
   if (readfds) {
@@ -828,8 +1245,22 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
     timeout_in = &timeout;
   }
-  int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
+#if REX_PLATFORM_WIN32
+  int host_nfds = nfds;
+#else
+  // The guest nfds is useless (UE3 passes 0), so derive it from the live sockets.
+  int host_nfds = SelectHostNfds(host_readfds, host_writefds, host_exceptfds);
+#endif
+  int ret = select(host_nfds, readfds ? &native_readfds : nullptr,
+                   writefds ? &native_writefds : nullptr,
                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
+  if (ret < 0) {
+#if REX_PLATFORM_WIN32
+    XThread::SetLastError(WSAGetLastError());
+#else
+    XThread::SetLastError(system_link::WsaErrorFromErrno(errno));
+#endif
+  }
   if (readfds) {
     host_readfds.UpdateFrom(&native_readfds);
     host_readfds.Store(readfds);
@@ -844,6 +1275,14 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
   }
 
   // TODO(gibbed): modify ret to be what's actually copied to the guest fd_sets?
+  static std::atomic<uint64_t> netlink_trace_count{0};
+  if (trace_link && NetLinkTraceAllow(&netlink_trace_count)) {
+    // No timeout pointer means block; shown as -1.000000.
+    REXLOG_INFO(
+        "[netlink] select nfds={} host_nfds={} read={} write={} except={} timeout={}.{:06d} ret={}",
+        nfds, host_nfds, trace_rc, trace_wc, trace_ec, trace_has_timeout ? trace_tv_sec : -1,
+        trace_has_timeout ? trace_tv_usec : 0, ret);
+  }
   return ret;
 }
 
@@ -855,7 +1294,11 @@ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Recv(buf_ptr, buf_len, flags);
+  int ret = socket->Recv(buf_ptr, buf_len, flags);
+  if (ret < 0) {
+    XThread::SetLastError(XSocket::LastHostError());
+  }
+  return ret;
 }
 
 u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
@@ -864,6 +1307,10 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] recvfrom s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
     return -1;
   }
 
@@ -875,24 +1322,31 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
   int ret =
       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
 
-  if (from_ptr) {
-    from_ptr->sin_family = native_from.sin_family;
-    from_ptr->sin_port = native_from.sin_port;
-    from_ptr->sin_addr = native_from.sin_addr;
-    std::memset(from_ptr->x_sin_zero, 0, sizeof(from_ptr->x_sin_zero));
+  if (ret >= 0 && from_ptr) {
+    StoreGuestSockaddrIn(from_ptr, native_from);
   }
-  if (fromlen_ptr) {
+  if (ret >= 0 && fromlen_ptr) {
     *fromlen_ptr = native_fromlen;
   }
 
   if (ret == -1) {
-// TODO: Better way of getting the error code
-#if REX_PLATFORM_WIN32
-    uint32_t error_code = WSAGetLastError();
-    XThread::SetLastError(error_code);
-#else
-    XThread::SetLastError(0x0);
-#endif
+    XThread::SetLastError(XSocket::LastHostError());
+  }
+
+  // Would-block polls must not spend the trace budget of real datagrams.
+  static std::atomic<uint64_t> netlink_trace_ok_count{0};
+  static std::atomic<uint64_t> netlink_trace_fail_count{0};
+  if (REXCVAR_GET(system_link_trace) &&
+      NetLinkTraceAllow(ret >= 0 ? &netlink_trace_ok_count : &netlink_trace_fail_count)) {
+    uint32_t trace_ip;
+    uint16_t trace_port;
+    NetLinkSplitAddrIn(from_ptr, &trace_ip, &trace_port);
+    REXLOG_INFO(
+        "[netlink] recvfrom s={:#010x} buf_len={} flags={:#x} from={}.{}.{}.{}:{} fromlen={} "
+        "ret={}",
+        socket_handle, buf_len, flags, (trace_ip >> 24) & 0xFF, (trace_ip >> 16) & 0xFF,
+        (trace_ip >> 8) & 0xFF, trace_ip & 0xFF, trace_port,
+        fromlen_ptr ? fromlen_ptr.value() : 0, ret);
   }
 
   return ret;
@@ -906,7 +1360,11 @@ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 bu
     return -1;
   }
 
-  return socket->Send(buf_ptr, buf_len, flags);
+  int ret = socket->Send(buf_ptr, buf_len, flags);
+  if (ret < 0) {
+    XThread::SetLastError(XSocket::LastHostError());
+  }
+  return ret;
 }
 
 u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
@@ -915,11 +1373,34 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 
   if (!socket) {
     // WSAENOTSOCK
     XThread::SetLastError(0x2736);
+    static std::atomic<uint64_t> netlink_trace_bad_count{0};
+    if (REXCVAR_GET(system_link_trace) && NetLinkTraceAllow(&netlink_trace_bad_count)) {
+      REXLOG_INFO("[netlink] sendto s={:#010x} ret=-1 (bad handle)", socket_handle);
+    }
     return -1;
   }
 
-  N_XSOCKADDR_IN native_to(to_ptr);
-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
+  N_XSOCKADDR_IN native_to;
+  if (to_ptr) {
+    native_to = *to_ptr;
+  }
+  int ret = socket->SendTo(buf_ptr, buf_len, flags, to_ptr ? &native_to : nullptr, to_len);
+  if (ret < 0) {
+    XThread::SetLastError(XSocket::LastHostError());
+  }
+  // Failed sends get their own trace budget, like recvfrom.
+  static std::atomic<uint64_t> netlink_trace_ok_count{0};
+  static std::atomic<uint64_t> netlink_trace_fail_count{0};
+  if (REXCVAR_GET(system_link_trace) &&
+      NetLinkTraceAllow(ret >= 0 ? &netlink_trace_ok_count : &netlink_trace_fail_count)) {
+    uint32_t trace_ip;
+    uint16_t trace_port;
+    NetLinkSplitAddrIn(to_ptr, &trace_ip, &trace_port);
+    REXLOG_INFO("[netlink] sendto s={:#010x} buf_len={} flags={:#x} to={}.{}.{}.{}:{} to_len={} ret={}",
+                socket_handle, buf_len, flags, (trace_ip >> 24) & 0xFF, (trace_ip >> 16) & 0xFF,
+                (trace_ip >> 8) & 0xFF, trace_ip & 0xFF, trace_port, to_len, ret);
+  }
+  return ret;
 }
 
 u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
@@ -966,6 +1447,9 @@ REX_EXPORT(__imp__NetDll_XNetSetSystemLinkPort,
            rex::kernel::xam::NetDll_XNetSetSystemLinkPort_entry)
 REX_EXPORT(__imp__NetDll_XNetGetEthernetLinkStatus,
            rex::kernel::xam::NetDll_XNetGetEthernetLinkStatus_entry)
+REX_EXPORT(__imp__NetDll_XNetRegisterKey, rex::kernel::xam::NetDll_XNetRegisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterKey, rex::kernel::xam::NetDll_XNetUnregisterKey_entry)
+REX_EXPORT(__imp__NetDll_XNetUnregisterInAddr, rex::kernel::xam::NetDll_XNetUnregisterInAddr_entry)
 REX_EXPORT(__imp__NetDll_XNetDnsLookup, rex::kernel::xam::NetDll_XNetDnsLookup_entry)
 REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease_entry)
 REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
@@ -981,6 +1465,8 @@ REX_EXPORT(__imp__NetDll_bind, rex::kernel::xam::NetDll_bind_entry)
 REX_EXPORT(__imp__NetDll_connect, rex::kernel::xam::NetDll_connect_entry)
 REX_EXPORT(__imp__NetDll_listen, rex::kernel::xam::NetDll_listen_entry)
 REX_EXPORT(__imp__NetDll_accept, rex::kernel::xam::NetDll_accept_entry)
+REX_EXPORT(__imp__NetDll_getsockname, rex::kernel::xam::NetDll_getsockname_entry)
+REX_EXPORT(__imp__NetDll_getpeername, rex::kernel::xam::NetDll_getpeername_entry)
 REX_EXPORT(__imp__NetDll_select, rex::kernel::xam::NetDll_select_entry)
 REX_EXPORT(__imp__NetDll_recv, rex::kernel::xam::NetDll_recv_entry)
 REX_EXPORT(__imp__NetDll_recvfrom, rex::kernel::xam::NetDll_recvfrom_entry)
@@ -988,6 +1474,58 @@ REX_EXPORT(__imp__NetDll_send, rex::kernel::xam::NetDll_send_entry)
 REX_EXPORT(__imp__NetDll_sendto, rex::kernel::xam::NetDll_sendto_entry)
 REX_EXPORT(__imp__NetDll___WSAFDIsSet, rex::kernel::xam::NetDll___WSAFDIsSet_entry)
 REX_EXPORT(__imp__NetDll_WSASetLastError, rex::kernel::xam::NetDll_WSASetLastError_entry)
+
+// M1 correctness: Gears of War 2 imports the stubs converted below, and
+// REX_EXPORT_STUB leaves r3 untouched (an undefined return). These replacements
+// behave like REX_STUB_RETURN (warn + fixed r3) and additionally emit a
+// once-only [netlink] line when system_link_trace is on. Socket APIs return
+// SOCKET_ERROR with WSAEOPNOTSUPP (0x273D, "operation not supported"); XNet APIs
+// return X_ERROR_FUNCTION_FAILED. Stubs GOW2 does not import are left alone.
+// The stub macros below are defined at global scope; the X_ERROR_* macros name X_RESULT.
+using rex::X_RESULT;
+
+#define NETLINK_STUB_RETURN(name, retval)                                           \
+  extern "C" REX_FUNC(name) {                                                       \
+    (void)base;                                                                     \
+    REXKRNL_WARN("{} STUB - returning {:#x}", #name, static_cast<uint32_t>(retval)); \
+    static bool netlink_stub_logged = false;                                        \
+    if (!netlink_stub_logged && REXCVAR_GET(system_link_trace)) {                   \
+      netlink_stub_logged = true;                                                   \
+      REXLOG_INFO("[netlink] stub {} returning {:#x} (unimplemented)", #name,        \
+                  static_cast<uint32_t>(retval));                                   \
+    }                                                                               \
+    ctx.r3.u64 = (retval);                                                          \
+  }                                                                                 \
+  static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+
+#define NETLINK_STUB_WSA(name, retval)                                              \
+  extern "C" REX_FUNC(name) {                                                       \
+    (void)base;                                                                     \
+    REXKRNL_WARN("{} STUB - returning {:#x}", #name, static_cast<uint32_t>(retval)); \
+    static bool netlink_stub_logged = false;                                        \
+    if (!netlink_stub_logged && REXCVAR_GET(system_link_trace)) {                   \
+      netlink_stub_logged = true;                                                   \
+      REXLOG_INFO("[netlink] stub {} returning {:#x} (unimplemented)", #name,        \
+                  static_cast<uint32_t>(retval));                                   \
+    }                                                                               \
+    ::rex::system::XThread::SetLastError(0x273D); /* WSAEOPNOTSUPP */                \
+    ctx.r3.u64 = (retval);                                                          \
+  }                                                                                 \
+  static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
+
+// M0 trace only: called out by the trace list but not imported by GOW2, so r3
+// is deliberately left untouched (no behavior change); logs when tracing is on.
+#define NETLINK_STUB_TRACE_ONLY(name)                                  \
+  extern "C" REX_FUNC(name) {                                          \
+    (void)base;                                                        \
+    REXKRNL_WARN("{} STUB", #name);                                    \
+    static std::atomic<uint64_t> netlink_trace_count{0};               \
+    if (REXCVAR_GET(system_link_trace) &&                              \
+        ::rex::kernel::xam::NetLinkTraceAllow(&netlink_trace_count)) { \
+      REXLOG_INFO("[netlink] {} called (unimplemented stub)", #name);  \
+    }                                                                  \
+  }                                                                    \
+  static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
 
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCalculateWorkBufferSize);
 REX_EXPORT_STUB(__imp__NetDll_UpnpActionCreate);
@@ -1003,11 +1541,12 @@ REX_EXPORT_STUB(__imp__NetDll_UpnpEventUnsubscribe);
 REX_EXPORT_STUB(__imp__NetDll_UpnpSearchCreate);
 REX_EXPORT_STUB(__imp__NetDll_UpnpSearchGetDevices);
 REX_EXPORT_STUB(__imp__NetDll_UpnpStartup);
-REX_EXPORT_STUB(__imp__NetDll_WSACancelOverlappedIO);
-REX_EXPORT_STUB(__imp__NetDll_WSAEventSelect);
-REX_EXPORT_STUB(__imp__NetDll_WSAGetOverlappedResult);
-REX_EXPORT_STUB(__imp__NetDll_WSARecv);
-REX_EXPORT_STUB(__imp__NetDll_WSASend);
+NETLINK_STUB_WSA(__imp__NetDll_WSACancelOverlappedIO, -1);
+NETLINK_STUB_WSA(__imp__NetDll_WSAEventSelect, -1);
+// BOOL API: FALSE (0) is failure; any nonzero value would mean success.
+NETLINK_STUB_WSA(__imp__NetDll_WSAGetOverlappedResult, 0);
+NETLINK_STUB_WSA(__imp__NetDll_WSARecv, -1);
+NETLINK_STUB_WSA(__imp__NetDll_WSASend, -1);
 REX_EXPORT_STUB(__imp__NetDll_WSAStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XHttpCloseHandle);
 REX_EXPORT_STUB(__imp__NetDll_XHttpConnect);
@@ -1034,24 +1573,21 @@ REX_EXPORT_STUB(__imp__NetDll_XHttpShutdown);
 REX_EXPORT_STUB(__imp__NetDll_XHttpStartup);
 REX_EXPORT_STUB(__imp__NetDll_XHttpWriteData);
 REX_EXPORT_STUB(__imp__NetDll_XNetConnect);
-REX_EXPORT_STUB(__imp__NetDll_XNetCreateKey);
+NETLINK_STUB_TRACE_ONLY(__imp__NetDll_XNetCreateKey);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseLookup);
 REX_EXPORT_STUB(__imp__NetDll_XNetDnsReverseRelease);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetBroadcastVersionStatus);
-REX_EXPORT_STUB(__imp__NetDll_XNetGetConnectStatus);
+NETLINK_STUB_TRACE_ONLY(__imp__NetDll_XNetGetConnectStatus);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
 REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
 REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
 REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
-REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
+NETLINK_STUB_RETURN(__imp__NetDll_XNetQosLookup, X_ERROR_FUNCTION_FAILED);
 REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
-REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
+NETLINK_STUB_RETURN(__imp__NetDll_XNetServerToInAddr, X_ERROR_FUNCTION_FAILED);
 REX_EXPORT_STUB(__imp__NetDll_XNetSetOpt);
 REX_EXPORT_STUB(__imp__NetDll_XNetStartupEx);
 REX_EXPORT_STUB(__imp__NetDll_XNetTsAddrToInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterInAddr);
-REX_EXPORT_STUB(__imp__NetDll_XNetUnregisterKey);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadContinue);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetParseTime);
 REX_EXPORT_STUB(__imp__NetDll_XmlDownloadGetReceivedDataSize);
@@ -1100,6 +1636,4 @@ REX_EXPORT_STUB(__imp__NetDll_XnpToolIpProxyInject);
 REX_EXPORT_STUB(__imp__NetDll_XnpToolSetCallbacks);
 REX_EXPORT_STUB(__imp__NetDll_XnpUnregisterKeyForCallerType);
 REX_EXPORT_STUB(__imp__NetDll_XnpUpdateConfigParams);
-REX_EXPORT_STUB(__imp__NetDll_getpeername);
-REX_EXPORT_STUB(__imp__NetDll_getsockname);
-REX_EXPORT_STUB(__imp__NetDll_getsockopt);
+REX_EXPORT(__imp__NetDll_getsockopt, rex::kernel::xam::NetDll_getsockopt_entry)

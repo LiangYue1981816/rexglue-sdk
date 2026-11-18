@@ -442,6 +442,17 @@ class DeferredCommandList {
 
   void EndDebugMarker() { WriteCommand(Command::kEndDebugMarker, 0); }
 
+  // Runs fn(command_list, user) when the list is replayed onto the real command list, in order
+  // with everything recorded before and after it. The callback may record any commands; it must
+  // leave the list usable (the processor marks its cached bindings stale afterwards).
+  using CallbackFn = void (*)(ID3D12GraphicsCommandList* command_list, void* user);
+  void Callback(CallbackFn fn, void* user) {
+    auto& args = *reinterpret_cast<CallbackArguments*>(
+        WriteCommand(Command::kCallback, sizeof(CallbackArguments)));
+    args.fn = fn;
+    args.user = user;
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -494,6 +505,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kCallback,
   };
 
   struct CommandHeader {
@@ -554,6 +566,11 @@ class DeferredCommandList {
     D3D12_TEXTURE_COPY_LOCATION src;
     D3D12_BOX src_box;
     bool has_src_box;
+  };
+
+  struct CallbackArguments {
+    CallbackFn fn;
+    void* user;
   };
 
   struct D3DDispatchArguments {

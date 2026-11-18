@@ -26,6 +26,11 @@ class VulkanInstance {
  public:
   static std::unique_ptr<VulkanInstance> Create(bool with_surface, bool try_enable_validation);
 
+  // Lets the app open the Vulkan loader itself, for example through libadrenotools with a custom
+  // driver on Android. The opener returns a dlopen handle, or nullptr for the platform loader.
+  using LoaderOpener = void* (*)();
+  static void SetLoaderOpener(LoaderOpener opener);
+
   VulkanInstance(const VulkanInstance&) = delete;
   VulkanInstance& operator=(const VulkanInstance&) = delete;
   VulkanInstance(VulkanInstance&&) = delete;

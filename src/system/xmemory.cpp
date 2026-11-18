@@ -47,6 +47,29 @@ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_s
   return rex::round_up(value, page_size) >> page_size_shift;
 }
 
+static const char* DescribeAllocationState(uint32_t state) {
+  const bool reserved = (state & kMemoryAllocationReserve) != 0;
+  const bool committed = (state & kMemoryAllocationCommit) != 0;
+  if (reserved && committed) {
+    return "reserve|commit";
+  }
+  if (reserved) {
+    return "reserve";
+  }
+  if (committed) {
+    return "commit";
+  }
+  return "free";
+}
+
+static bool HostPageWritable(void* host_address) {
+  rex::memory::PageAccess access = rex::memory::PageAccess::kNoAccess;
+  size_t length = rex::memory::page_size();
+  rex::memory::QueryProtect(host_address, length, access);
+  return access == rex::memory::PageAccess::kReadWrite ||
+         access == rex::memory::PageAccess::kExecuteReadWrite;
+}
+
 /**
  * Memory map:
  * 0x00000000 - 0x3FFFFFFF (1024mb) - virtual 4k pages
@@ -547,6 +570,26 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread 0x{:X}",
         is_write ? "write" : "read", virtual_address, reinterpret_cast<uintptr_t>(host_address),
         rex::thread::current_thread_id());
+    if (!heap) {
+      REXSYS_ERROR("Unhandled guest access violation: no guest heap owns 0x{:08X}",
+                   virtual_address);
+    } else {
+      const uint32_t guest_page_size = heap->page_size();
+      const uint32_t page_base = virtual_address & ~(guest_page_size - 1u);
+      HeapAllocationInfo info{};
+      if (!heap->QueryRegionInfo(page_base, &info)) {
+        REXSYS_ERROR(
+            "Unhandled guest access violation: heap 0x{:08X} (page 0x{:X}) page 0x{:08X} region "
+            "query failed",
+            heap->heap_base(), guest_page_size, page_base);
+      } else {
+        REXSYS_ERROR(
+            "Unhandled guest access violation: heap 0x{:08X} (page 0x{:X}) page 0x{:08X} "
+            "state={} protect=0x{:X} allocation 0x{:08X} size 0x{:X} region 0x{:X}",
+            heap->heap_base(), guest_page_size, page_base, DescribeAllocationState(info.state),
+            info.protect, info.allocation_base, info.allocation_size, info.region_size);
+      }
+    }
     return false;
   }
 
@@ -558,6 +601,13 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   auto physical_heap = static_cast<PhysicalHeap*>(heap);
   if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
                                       is_write, false)) {
+    return true;
+  }
+
+  // No watch covers the page. A write that lost the race to clear the watch finds the host page
+  // writable again (on POSIX the fault handler no longer rechecks writes before calling here):
+  // retry it without the stale-protection recovery and its warning.
+  if (is_write && HostPageWritable(host_address)) {
     return true;
   }
 

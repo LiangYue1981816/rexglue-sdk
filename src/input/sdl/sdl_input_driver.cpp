@@ -9,19 +9,53 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../stick_deadzone.h"
+
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
+#include <rex/input/input_system.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/pad_remap.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+
+REXCVAR_DEFINE_STRING(pad_map_a, "a", "Input",
+                      "Controller button that presses the game's A button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_b, "b", "Input",
+                      "Controller button that presses the game's B button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_x, "x", "Input",
+                      "Controller button that presses the game's X button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_y, "y", "Input",
+                      "Controller button that presses the game's Y button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_lb, "lb", "Input",
+                      "Controller button that presses the game's LB button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_rb, "rb", "Input",
+                      "Controller button that presses the game's RB button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_back, "back", "Input",
+                      "Controller button that presses the game's Back button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_start, "start", "Input",
+                      "Controller button that presses the game's Start button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_ls, "ls", "Input",
+                      "Controller button that presses the game's LS button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_rs, "rs", "Input",
+                      "Controller button that presses the game's RS button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_dpad_up, "dpad_up", "Input",
+                      "Controller button that presses the game's Dpad Up button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_dpad_down, "dpad_down", "Input",
+                      "Controller button that presses the game's Dpad Down button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_dpad_left, "dpad_left", "Input",
+                      "Controller button that presses the game's Dpad Left button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
+REXCVAR_DEFINE_STRING(pad_map_dpad_right, "dpad_right", "Input",
+                      "Controller button that presses the game's Dpad Right button: a, b, x, y, lb, rb, back, start, ls, rs, dpad_up, dpad_down, dpad_left, dpad_right or none");
 
 namespace rex::input::sdl {
 
@@ -29,6 +63,26 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+std::array<uint16_t, 14> CurrentSources() {
+  using rex::input::pad_remap::BitForName;
+  std::array<uint16_t, 14> sources{};
+  sources[0]  = BitForName(std::string_view(REXCVAR_GET(pad_map_a)));
+  sources[1]  = BitForName(std::string_view(REXCVAR_GET(pad_map_b)));
+  sources[2]  = BitForName(std::string_view(REXCVAR_GET(pad_map_x)));
+  sources[3]  = BitForName(std::string_view(REXCVAR_GET(pad_map_y)));
+  sources[4]  = BitForName(std::string_view(REXCVAR_GET(pad_map_lb)));
+  sources[5]  = BitForName(std::string_view(REXCVAR_GET(pad_map_rb)));
+  sources[6]  = BitForName(std::string_view(REXCVAR_GET(pad_map_back)));
+  sources[7]  = BitForName(std::string_view(REXCVAR_GET(pad_map_start)));
+  sources[8]  = BitForName(std::string_view(REXCVAR_GET(pad_map_ls)));
+  sources[9]  = BitForName(std::string_view(REXCVAR_GET(pad_map_rs)));
+  sources[10] = BitForName(std::string_view(REXCVAR_GET(pad_map_dpad_up)));
+  sources[11] = BitForName(std::string_view(REXCVAR_GET(pad_map_dpad_down)));
+  sources[12] = BitForName(std::string_view(REXCVAR_GET(pad_map_dpad_left)));
+  sources[13] = BitForName(std::string_view(REXCVAR_GET(pad_map_dpad_right)));
+  return sources;
+}
 
 }  // namespace
 
@@ -221,6 +275,11 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     // pressed buttons aren't lost and will be visible again.
     std::memset(&out_state->gamepad, 0, sizeof(out_state->gamepad));
   }
+  auto [dead_rx, dead_ry] = ApplyRightStickDeadzone(
+      static_cast<int16_t>(out_state->gamepad.thumb_rx),
+      static_cast<int16_t>(out_state->gamepad.thumb_ry), REXCVAR_GET(pad_right_stick_deadzone));
+  out_state->gamepad.thumb_rx = dead_rx;
+  out_state->gamepad.thumb_ry = dead_ry;
   return X_ERROR_SUCCESS;
 }
 
@@ -469,6 +528,7 @@ void SDLInputDriver::OnControllerDeviceAddedLocked(const SDL_Event& event) {
 
   const int ordinal = static_cast<int>(controllers_.size()) - 1;
   SDL_SetGamepadPlayerIndex(controller, ordinal);
+  NotePhysicalPadType(static_cast<int>(SDL_GetGamepadType(controller)));
 
   REXLOG_INFO("SDL OnControllerDeviceAdded: connection order {}, device {}.", ordinal,
               static_cast<uint64_t>(state.id));
@@ -521,6 +581,24 @@ void SDLInputDriver::OnControllerDeviceAxisMotionLocked(const SDL_Event& event) 
       assert_always();
       break;
   }
+  bool active = false;
+  switch (event.gaxis.axis) {
+    case SDL_GAMEPAD_AXIS_LEFTX:
+    case SDL_GAMEPAD_AXIS_LEFTY:
+    case SDL_GAMEPAD_AXIS_RIGHTX:
+    case SDL_GAMEPAD_AXIS_RIGHTY:
+      active = std::abs(static_cast<int>(event.gaxis.value)) > 6000;
+      break;
+    case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+    case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
+      active = event.gaxis.value > 3840;
+      break;
+    default:
+      break;
+  }
+  if (active) {
+    NotePhysicalPadActivity(static_cast<int>(SDL_GetGamepadType(controllers_.at(*idx).sdl)));
+  }
   controllers_.at(*idx).state_changed = true;
 }
 
@@ -566,8 +644,10 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     return;
   }
   auto& controller = controllers_.at(*idx);
+  if (event.gbutton.down) {
+    NotePhysicalPadActivity(static_cast<int>(SDL_GetGamepadType(controller.sdl)));
+  }
 
-  uint16_t xbuttons = controller.state.gamepad.buttons;
   // Lookup the XInput button code.
   if (event.gbutton.button >= xbutton_lookup.size()) {
     // A newer SDL Version may have added new buttons.
@@ -580,11 +660,11 @@ void SDLInputDriver::OnControllerDeviceButtonChangedLocked(const SDL_Event& even
     if (xbutton == X_INPUT_GAMEPAD_GUIDE && !REXCVAR_GET(guide_button)) {
       return;
     }
-    xbuttons |= xbutton;
+    controller.physical_buttons |= xbutton;
   } else {
-    xbuttons &= ~xbutton;
+    controller.physical_buttons &= ~xbutton;
   }
-  controller.state.gamepad.buttons = xbuttons;
+  controller.state.gamepad.buttons = pad_remap::Remap(controller.physical_buttons, CurrentSources());
   controller.state_changed = true;
 }
 

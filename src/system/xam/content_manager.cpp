@@ -442,13 +442,12 @@ X_RESULT ContentManager::UnmountAndDeleteContent(uint64_t xuid,
   return X_ERROR_FILE_NOT_FOUND;
 }
 
-std::filesystem::path ContentManager::ResolveGameUserContentPath() {
+std::filesystem::path ContentManager::ResolveGameUserContentPath(const std::string& user_name) {
   auto title_id = fmt::format("{:08X}", kernel_state_->title_id());
-  auto user_name = rex::to_path(kernel_state_->user_profile()->name());
 
   // Per-game per-profile data location:
   // content_root/title_id/profile/user_name
-  return root_path_ / title_id / kGameUserContentDirName / user_name;
+  return root_path_ / title_id / kGameUserContentDirName / rex::to_path(user_name);
 }
 
 std::unordered_map<string::string_key_case, ContentPackage*,

@@ -10,8 +10,10 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string_view>
 
@@ -23,23 +25,87 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
+#include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/memory/utils.h>
 #include <rex/memory/ring_buffer.h>
+#include <rex/platform.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#include "native_frontend_snapshot.h"
+
+#if REX_PLATFORM_ANDROID
+#include <chrono>
+#include <thread>
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_BOOL(gpu_native, false, "GPU",
+                   "Native renderer, phase 1 (docs/NATIVE_RENDERER_PHASE1.md in the game repository): the command "
+                   "processor still reads every packet (fences, interrupts, swaps) but draws and resolves do not "
+                   "run, so nothing of the frame is emulated")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(gpu_msaa_fill_at_1x, false, "GPU",
+                    "Run Direct3D's 4x MSAA fills (clears drawn with its embedded shaders) as 1x draws at twice "
+                    "the size on the same EDRAM, so the 1x render target that owns that EDRAM keeps it and "
+                    "nothing is copied to a 4x render target and back");
+
+REXCVAR_DEFINE_BOOL(gpu_native_frontend, true, "GPU",
+                    "Draw the packets the game rewrote into native draws from the game's device snapshot");
+
+REXCVAR_DEFINE_BOOL(gpu_native_frontend_verify, false, "GPU",
+                    "Compare each native draw's device snapshot with the register file before writing it "
+                    "and count the mismatching register groups (NATIVEFRONT log line)");
+REXCVAR_DEFINE_BOOL(gpu_native_frontend_timing, false, "GPU",
+                    "Time each native draw's snapshot apply, shader binding and draw issue on the command "
+                    "thread and log the averages per draw next to the NATIVEFRONT line");
+
+REXCVAR_DEFINE_BOOL(gpu_bulk_register_writes, true, "GPU",
+                    "Copies command-stream register writes in the 0x2000-0x23FF range (no write "
+                    "side effects) straight into the register file and writes type-0 packet ranges "
+                    "in one call; false writes each register through WriteRegister (for A/B runs)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_INT32(gpu_worker_spin_us, -1, "GPU",
+                     "Microseconds the GPU command thread polls for new commands, pausing with an "
+                     "ISB between polls, before it sleeps on the write pointer event; -1 (the "
+                     "default) keeps the SDK's 500 yields: on the S25 Ultra 50 changed neither CPU "
+                     "use nor the frame rate at the thermal cap")
+    .range(-1, 10000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// Re-uploading every CPU-written page at each frame end costs a Vulkan render pass per upload on a
+// tiling GPU (Gears of War 2: ~1,850 uploads and ~1,600 passes a frame, half the frame rate on the
+// Adreno 830); the memory watches still catch the CPU's writes.
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "Refresh page-valid state from GPU-written memory at frame end. "
+                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#else
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+#endif
+
+// Off by default: on the phone it changed nothing while the guest spins on the read pointer; it
+// is meant for guests that sleep between polls.
+REXCVAR_DEFINE_BOOL(gpu_read_pointer_writeback_blocks, false, "GPU",
+                    "Write the ring buffer's read pointer back to the guest every block the guest "
+                    "asked for while packets run, like the Xbox 360 GPU, instead of only after a "
+                    "whole batch")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
@@ -69,6 +135,11 @@ REXCVAR_DEFINE_BOOL(readback_memexport_fast, true, "GPU",
                     "automatic fallback to full synchronous readback")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_vertex_buffer_state_skip, false, "GPU",
+                    "Old behaviour: skip requesting a vertex buffer whose address and size match the last "
+                    "draw on that slot, even in a new frame (stale CPU-written data)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_INT32(query_occlusion_fake_sample_count, 1000, "GPU",
                      "Fake sample count for occlusion queries")
     .range(1, 100000)
@@ -85,6 +156,348 @@ namespace rex::graphics {
 using namespace rex::graphics::xenos;
 
 namespace {
+
+// Whether the bound shaders came embedded in the packet stream (IM_LOAD_IMMEDIATE: Direct3D's own
+// clears and copies) rather than from the game's memory.
+bool g_vertex_shader_embedded = false;
+bool g_pixel_shader_embedded = false;
+
+constexpr uint32_t kMsaaFillMaxPitchPixels = 4096;
+constexpr uint32_t kMsaaFillMaxWindowOffset = 4096;
+constexpr uint32_t kScissorUnbounded = 8192;
+constexpr uint32_t kSideEffectFreeFirst = 0x2000;
+constexpr uint32_t kSideEffectFreeLast = 0x23FF;
+
+bool IsSideEffectFreeRange(uint32_t first, uint32_t count) {
+  return count && first >= kSideEffectFreeFirst && first <= kSideEffectFreeLast &&
+         count - 1 <= kSideEffectFreeLast - first;
+}
+
+bool IsConstantFillShader(const Shader* shader) {
+  return shader && shader->is_ucode_analyzed() && shader->texture_bindings().empty() &&
+         !shader->memexport_eM_written();
+}
+
+bool BlendReplaces(const RegisterFile& regs, uint32_t rt_index) {
+  auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[rt_index]);
+  return blend.color_srcblend == xenos::BlendFactor::kOne &&
+         blend.color_destblend == xenos::BlendFactor::kZero &&
+         blend.color_comb_fcn == xenos::BlendOp::kAdd &&
+         blend.alpha_srcblend == xenos::BlendFactor::kOne &&
+         blend.alpha_destblend == xenos::BlendFactor::kZero &&
+         blend.alpha_comb_fcn == xenos::BlendOp::kAdd;
+}
+
+bool ColorWritesReplace(const RegisterFile& regs, const Shader* pixel_shader) {
+  uint32_t color_mask =
+      pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets()) : 0;
+  for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+    if (((color_mask >> (4 * i)) & 0b1111) && !BlendReplaces(regs, i)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool RasterizesLikeAFill(const RegisterFile& regs) {
+  // Alpha test of a constant colour passes or fails everywhere alike; alpha to coverage depends on the
+  // sample count.
+  if (regs.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable) {
+    return false;
+  }
+  auto mode = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  if (mode.poly_offset_front_enable || mode.poly_offset_back_enable ||
+      mode.poly_mode != xenos::PolygonModeEnable::kDisabled) {
+    return false;
+  }
+  // Direct3D draws its clears as rectangle lists.
+  return draw_util::IsPrimitivePolygonal(regs) ||
+         regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type == xenos::PrimitiveType::kRectangleList;
+}
+
+bool FitsAtTwiceTheSize(const RegisterFile& regs) {
+  auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+  return regs.Get<reg::RB_SURFACE_INFO>().surface_pitch <= kMsaaFillMaxPitchPixels &&
+         uint32_t(std::abs(int32_t(window_offset.window_x_offset))) < kMsaaFillMaxWindowOffset &&
+         uint32_t(std::abs(int32_t(window_offset.window_y_offset))) < kMsaaFillMaxWindowOffset;
+}
+
+// A 4x MSAA pixel covers a 2x2 block of samples, the same EDRAM a 1x draw at twice the size covers. A fill
+// with a constant value writes the same bits to every sample either way, so it can run at 1x on the
+// render target that already owns the EDRAM instead of moving the EDRAM to a 4x render target and back.
+// Only Direct3D's embedded shaders without textures qualify (its clears), drawn without blending, alpha
+// to coverage or polygon offset.
+bool IsMsaaFillAt1xEligible(const RegisterFile& regs, const Shader* vertex_shader, const Shader* pixel_shader) {
+  if (!g_vertex_shader_embedded) {
+    return false;
+  }
+  xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  bool depth_only = edram_mode == xenos::EdramMode::kDepthOnly;
+  if ((edram_mode != xenos::EdramMode::kColorDepth && !depth_only) ||
+      regs.Get<reg::RB_SURFACE_INFO>().msaa_samples != xenos::MsaaSamples::k4X) {
+    return false;
+  }
+  if (!IsConstantFillShader(vertex_shader)) {
+    return false;
+  }
+  // In kDepth mode the pixel shader does not run and no colour is written.
+  if (depth_only) {
+    return RasterizesLikeAFill(regs) && FitsAtTwiceTheSize(regs);
+  }
+  if (!g_pixel_shader_embedded) {
+    return false;
+  }
+  if (pixel_shader &&
+      (!IsConstantFillShader(pixel_shader) || pixel_shader->writes_depth() || pixel_shader->kills_pixels())) {
+    return false;
+  }
+  return RasterizesLikeAFill(regs) && ColorWritesReplace(regs, pixel_shader) && FitsAtTwiceTheSize(regs);
+}
+
+uint32_t DoubledScissor(uint32_t value) { return std::min(value * 2, kScissorUnbounded); }
+
+class MsaaFillAt1x {
+ public:
+  explicit MsaaFillAt1x(RegisterFile& regs) : regs_(regs) {}
+  MsaaFillAt1x(const MsaaFillAt1x&) = delete;
+  MsaaFillAt1x& operator=(const MsaaFillAt1x&) = delete;
+  ~MsaaFillAt1x() { Restore(); }
+
+  void Apply() {
+    for (size_t i = 0; i < kRegisters.size(); ++i) {
+      saved_[i] = regs_[kRegisters[i]];
+    }
+    applied_ = true;
+    DoubleSurface();
+    DoubleViewport();
+    DoubleWindow();
+  }
+
+ private:
+  static constexpr std::array<uint32_t, 11> kRegisters = {
+      XE_GPU_REG_RB_SURFACE_INFO,      XE_GPU_REG_PA_CL_VTE_CNTL,         XE_GPU_REG_PA_CL_VPORT_XSCALE,
+      XE_GPU_REG_PA_CL_VPORT_XOFFSET,  XE_GPU_REG_PA_CL_VPORT_YSCALE,     XE_GPU_REG_PA_CL_VPORT_YOFFSET,
+      XE_GPU_REG_PA_SC_WINDOW_OFFSET,  XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL, XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR,
+      XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL, XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR};
+
+  void Restore() {
+    if (!applied_) {
+      return;
+    }
+    for (size_t i = 0; i < kRegisters.size(); ++i) {
+      regs_[kRegisters[i]] = saved_[i];
+    }
+    applied_ = false;
+  }
+
+  void DoubleSurface() {
+    auto surface_info = regs_.Get<reg::RB_SURFACE_INFO>();
+    surface_info.surface_pitch = surface_info.surface_pitch * 2;
+    surface_info.msaa_samples = xenos::MsaaSamples::k1X;
+    regs_[XE_GPU_REG_RB_SURFACE_INFO] = surface_info.value;
+  }
+
+  // Screen position u (4x pixels) to U (1x pixels): U = 2u for pixel centres at .5, U = 2u + 0.5 for
+  // Direct3D's centres at .0 (a 4x pixel's edge u = p - 0.5 lands on the edge 2p - 0.5 of its 1x block).
+  void DoubleViewport() {
+    auto vte = regs_.Get<reg::PA_CL_VTE_CNTL>();
+    float centre = regs_.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+    DoubleAxis(vte.vport_x_scale_ena, vte.vport_x_offset_ena, XE_GPU_REG_PA_CL_VPORT_XSCALE,
+               XE_GPU_REG_PA_CL_VPORT_XOFFSET, centre);
+    DoubleAxis(vte.vport_y_scale_ena, vte.vport_y_offset_ena, XE_GPU_REG_PA_CL_VPORT_YSCALE,
+               XE_GPU_REG_PA_CL_VPORT_YOFFSET, centre);
+    vte.vport_x_scale_ena = 1;
+    vte.vport_x_offset_ena = 1;
+    vte.vport_y_scale_ena = 1;
+    vte.vport_y_offset_ena = 1;
+    regs_[XE_GPU_REG_PA_CL_VTE_CNTL] = vte.value;
+  }
+
+  void DoubleAxis(uint32_t scale_enabled, uint32_t offset_enabled, uint32_t scale_register,
+                  uint32_t offset_register, float centre) {
+    float scale = scale_enabled ? regs_.Get<float>(scale_register) : 1.0f;
+    float offset = offset_enabled ? regs_.Get<float>(offset_register) : 0.0f;
+    regs_[scale_register] = rex::memory::Reinterpret<uint32_t>(scale * 2.0f);
+    regs_[offset_register] = rex::memory::Reinterpret<uint32_t>(offset * 2.0f + centre);
+  }
+
+  void DoubleWindow() {
+    auto window_offset = regs_.Get<reg::PA_SC_WINDOW_OFFSET>();
+    window_offset.window_x_offset = window_offset.window_x_offset * 2;
+    window_offset.window_y_offset = window_offset.window_y_offset * 2;
+    regs_[XE_GPU_REG_PA_SC_WINDOW_OFFSET] = window_offset.value;
+    auto window_tl = regs_.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
+    window_tl.tl_x = DoubledScissor(window_tl.tl_x);
+    window_tl.tl_y = DoubledScissor(window_tl.tl_y);
+    regs_[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL] = window_tl.value;
+    auto window_br = regs_.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
+    window_br.br_x = DoubledScissor(window_br.br_x);
+    window_br.br_y = DoubledScissor(window_br.br_y);
+    regs_[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR] = window_br.value;
+    auto screen_tl = regs_.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
+    screen_tl.tl_x = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_tl.tl_x), int32_t(0)))));
+    screen_tl.tl_y = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_tl.tl_y), int32_t(0)))));
+    regs_[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL] = screen_tl.value;
+    auto screen_br = regs_.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
+    screen_br.br_x = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_br.br_x), int32_t(0)))));
+    screen_br.br_y = int32_t(DoubledScissor(uint32_t(std::max(int32_t(screen_br.br_y), int32_t(0)))));
+    regs_[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR] = screen_br.value;
+  }
+
+  RegisterFile& regs_;
+  std::array<uint32_t, kRegisters.size()> saved_{};
+  bool applied_ = false;
+};
+
+void ReportMsaaFillAt1x() {
+  static uint64_t count = 0;
+  if ((count++ & 0x3FFF) == 0) {
+    REXGPU_INFO("MSAAFILL1X {} 4x fills drawn at 1x", count);
+  }
+}
+
+// Draw packet words already decoded to host order (a native front end draw), read by the draw
+// handlers instead of the ring when they get a null reader. Command processor thread only.
+thread_local const uint32_t* g_decoded_draw_words = nullptr;
+
+uint32_t ReadDrawWord(memory::RingBuffer* reader) {
+  if (reader) {
+    return reader->ReadAndSwap<uint32_t>();
+  }
+  return *g_decoded_draw_words++;
+}
+
+void SkipDrawWords(memory::RingBuffer* reader, uint32_t count) {
+  if (reader) {
+    reader->AdvanceRead(count * sizeof(uint32_t));
+  } else {
+    g_decoded_draw_words += count;
+  }
+}
+
+// Native front end counters, logged and reset every kNativeFrontendLogSwaps swaps.
+constexpr uint32_t kNativeFrontendLogSwaps = 300;
+struct NativeFrontendStats {
+  uint64_t draws = 0;
+  uint64_t draws_indx2 = 0;
+  uint64_t verified = 0;
+  uint64_t mismatch_surf = 0;
+  uint64_t mismatch_prog = 0;
+  uint64_t mismatch_rs = 0;
+  uint64_t mismatch_vp = 0;
+  uint64_t mismatch_scis = 0;
+  uint64_t mismatch_fetch = 0;
+  uint64_t mismatch_alu = 0;
+  uint64_t mismatch_g2280 = 0;
+  uint64_t mismatch_g2300 = 0;
+  uint64_t mismatch_g2380 = 0;
+  uint64_t mismatch_g2388 = 0;
+  uint64_t mismatch_bool = 0;
+  uint64_t mismatch_wofs = 0;
+  uint64_t shader_loads = 0;
+  uint64_t shader_load_skipped = 0;
+  uint64_t bad_snapshot = 0;
+  uint64_t timed_draws = 0;
+  uint64_t apply_ticks = 0;
+  uint64_t shader_ticks = 0;
+  uint64_t issue_ticks = 0;
+  uint32_t swaps = 0;
+};
+
+double TicksToMicrosecondsPerDraw(uint64_t ticks, uint64_t draws) {
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  return draws && frequency ? double(ticks) * 1e6 / double(frequency) / double(draws) : 0.0;
+}
+NativeFrontendStats g_native_frontend_stats;
+
+void ReportNativeFrontendOnSwap() {
+  NativeFrontendStats& s = g_native_frontend_stats;
+  if (++s.swaps < kNativeFrontendLogSwaps) {
+    return;
+  }
+  REXGPU_INFO(
+      "NATIVEFRONT draws {} draws_indx2 {} verified {} mismatches surf {} prog {} rs {} vp {} "
+      "scis {} fetch {} alu {} g2280 {} g2300 {} g2380 {} g2388 {} bool {} wofs {} "
+      "shader_loads {} shader_load_skipped {} bad_snapshot {}",
+      s.draws, s.draws_indx2, s.verified, s.mismatch_surf, s.mismatch_prog, s.mismatch_rs, s.mismatch_vp,
+      s.mismatch_scis, s.mismatch_fetch, s.mismatch_alu, s.mismatch_g2280, s.mismatch_g2300,
+      s.mismatch_g2380, s.mismatch_g2388, s.mismatch_bool, s.mismatch_wofs, s.shader_loads,
+      s.shader_load_skipped, s.bad_snapshot);
+  if (s.timed_draws) {
+    REXGPU_INFO("NATIVEFRONT timing per draw: apply {:.3f} us shader {:.3f} us issue {:.3f} us ({} draws)",
+                TicksToMicrosecondsPerDraw(s.apply_ticks, s.timed_draws),
+                TicksToMicrosecondsPerDraw(s.shader_ticks, s.timed_draws),
+                TicksToMicrosecondsPerDraw(s.issue_ticks, s.timed_draws), s.timed_draws);
+  }
+  s = NativeFrontendStats();
+}
+
+// The last shader of each type (0 vertex, 1 pixel) LoadShaderFromMemory bound for a native draw, so
+// a draw with the same microcode as the one before doesn't load it again. Reset whenever a packet
+// binds a shader, since that replaces the active shader behind this cache's back.
+struct NativeShaderLoad {
+  bool valid = false;
+  uint32_t guest_address = 0;
+  uint32_t size_dwords = 0;
+};
+NativeShaderLoad g_native_shader_loads[2];
+
+void ResetNativeShaderLoads() {
+  g_native_shader_loads[0] = NativeShaderLoad();
+  g_native_shader_loads[1] = NativeShaderLoad();
+}
+
+// Binds the shader of the given type whose microcode is at a physical guest address, like the PM4
+// IM_LOAD packet. load is the command processor's LoadShader with the host address translated
+// (a protected member, so it comes in as a callable); the active shader pointers are updated.
+template <typename LoadFn>
+bool LoadShaderFromMemory(LoadFn&& load, Shader*& active_vertex_shader,
+                          Shader*& active_pixel_shader, xenos::ShaderType shader_type,
+                          uint32_t guest_address, uint32_t size_dwords) {
+  auto shader = load(shader_type, guest_address, size_dwords);
+  switch (shader_type) {
+    case xenos::ShaderType::kVertex:
+      active_vertex_shader = shader;
+      g_vertex_shader_embedded = false;
+      break;
+    case xenos::ShaderType::kPixel:
+      active_pixel_shader = shader;
+      g_pixel_shader_embedded = false;
+      break;
+    default:
+      assert_unhandled_case(shader_type);
+      return false;
+  }
+  return true;
+}
+
+}  // namespace
+
+namespace {
+
+#if REX_PLATFORM_ANDROID
+static void PauseGpuWorkerPoll() {
+#if defined(__aarch64__)
+  __asm__ __volatile__("isb" ::: "memory");
+#else
+  std::this_thread::yield();
+#endif
+}
+#endif
+
+// Writes the read index back once the reader has moved a whole block past the last index written
+// back; returns the index last written back.
+uint32_t WriteBackReadIndexEveryBlock(const memory::RingBuffer& reader, uint32_t written_back,
+                                      uint32_t block_dwords, void* writeback) {
+  const uint32_t ring_dwords = uint32_t(reader.capacity() / sizeof(uint32_t));
+  const uint32_t index = uint32_t(reader.read_offset() / sizeof(uint32_t));
+  const uint32_t moved = (index + ring_dwords - written_back) % ring_dwords;
+  if (moved < block_dwords) {
+    return written_back;
+  }
+  memory::store_and_swap<uint32_t>(writeback, index);
+  return index;
+}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -217,6 +630,22 @@ void CommandProcessor::WorkerThreadMain() {
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
       PrepareForWait();
+#if REX_PLATFORM_ANDROID
+      const int32_t spin_us = REXCVAR_GET(gpu_worker_spin_us);
+      if (spin_us >= 0) {
+        const auto spin_deadline =
+            std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+        do {
+          if (std::chrono::steady_clock::now() < spin_deadline) {
+            PauseGpuWorkerPoll();
+          } else {
+            rex::thread::Wait(write_ptr_index_event_.get(), true, std::chrono::milliseconds(5));
+          }
+          write_ptr_index = write_ptr_index_.load();
+        } while (worker_running_ && pending_fns_.empty() &&
+                 (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+      } else {
+#endif
       uint32_t loop_count = 0;
       do {
         // If we spin around too much, revert to a "low-power" state.
@@ -231,6 +660,9 @@ void CommandProcessor::WorkerThreadMain() {
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+#if REX_PLATFORM_ANDROID
+      }
+#endif
       ReturnFromWait();
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
@@ -493,6 +925,14 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
+  if (!num_registers) {
+    return;
+  }
+  if (REXCVAR_GET(gpu_bulk_register_writes) &&
+      IsSideEffectFreeRange(start_index, num_registers)) {
+    memory::copy_and_swap(register_file_->values + start_index, base, num_registers);
+    return;
+  }
   for (uint32_t i = 0; i < num_registers; ++i) {
     uint32_t data = memory::load_and_swap<uint32_t>(base + i);
     WriteRegister(start_index + i, data);
@@ -619,12 +1059,22 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  // The guest waits on the read pointer for ring space: write it back block by block, as the GPU
+  // does, not only after the batch (WorkerThreadMain still writes the batch end).
+  void* const writeback = read_ptr_writeback_ptr_ && REXCVAR_GET(gpu_read_pointer_writeback_blocks)
+                              ? memory_->TranslatePhysical(read_ptr_writeback_ptr_)
+                              : nullptr;
+  const uint32_t block_dwords = std::max(read_ptr_update_freq_, uint32_t(1));
+  uint32_t written_back = read_index;
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    if (writeback) {
+      written_back = WriteBackReadIndexEveryBlock(reader, written_back, block_dwords, writeback);
     }
   } while (reader.read_count());
 
@@ -702,6 +1152,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (REXCVAR_GET(gpu_bulk_register_writes) && !write_one_reg) {
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
@@ -904,9 +1358,165 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
 
 bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
                                               uint32_t count) {
+  // A DRAW_INDX or DRAW_INDX_2 the game rewrote into a native draw: 'NATV', the low and high
+  // halves of a host pointer to the device snapshot, padding. Drawn here, in ring order, from the
+  // snapshot.
+  uint32_t words_read = 0;
+  bool native_draw = false;
+  if (count >= 4 && REXCVAR_GET(gpu_native_frontend)) {
+    native_draw = reader->ReadAndSwap<uint32_t>() == native_frontend::kPacketMagic;
+    words_read = 1;
+  }
+  if (native_draw) {
+    using native_frontend::NativeDrawSnapshot;
+    uint64_t snapshot_low = reader->ReadAndSwap<uint32_t>();
+    uint64_t snapshot_high = reader->ReadAndSwap<uint32_t>();
+    reader->AdvanceRead((count - 3) * sizeof(uint32_t));
+    const auto* snapshot = reinterpret_cast<const NativeDrawSnapshot*>(
+        static_cast<uintptr_t>(snapshot_low | (snapshot_high << 32)));
+    NativeFrontendStats& stats = g_native_frontend_stats;
+    if (!snapshot || snapshot->magic != native_frontend::kSnapshotMagic ||
+        snapshot->size != sizeof(NativeDrawSnapshot) ||
+        (snapshot->draw_opcode != native_frontend::kDrawOpcodeIndx &&
+         snapshot->draw_opcode != native_frontend::kDrawOpcodeIndx2) ||
+        (snapshot->draw_opcode == native_frontend::kDrawOpcodeIndx2 &&
+         (snapshot->draw_word_count < 1 || snapshot->draw_word_count > 4))) {
+      // The draw is lost.
+      ++stats.bad_snapshot;
+      return true;
+    }
+
+    const RegisterFile& regs = *register_file_;
+    if (REXCVAR_GET(gpu_native_frontend_verify)) {
+      auto differs = [&regs](uint32_t first, const uint32_t* values, uint32_t n) {
+        return std::memcmp(regs.values + first, values, n * sizeof(uint32_t)) != 0;
+      };
+      stats.mismatch_surf += differs(0x2000, snapshot->surf, 6);
+      stats.mismatch_prog += differs(0x2180, snapshot->prog, 2);
+      stats.mismatch_rs += differs(0x2200, snapshot->rs, 12);
+      stats.mismatch_vp += differs(0x2100, snapshot->vp, 21);
+      stats.mismatch_scis += differs(0x2081, snapshot->scissor, 2);
+      stats.mismatch_fetch += differs(0x4800, snapshot->fetch, 192);
+      bool alu_differs = false;
+      for (uint32_t i = 0; i < 128 && !alu_differs; ++i) {
+        alu_differs = !snapshot->alu[i] || differs(0x4000 + 16 * i, snapshot->alu[i], 16);
+      }
+      stats.mismatch_alu += alu_differs;
+      stats.mismatch_g2280 += differs(0x2280, snapshot->g2280, 21);
+      stats.mismatch_g2300 += differs(0x2300, snapshot->g2300, 38);
+      stats.mismatch_g2380 += differs(0x2380, snapshot->g2380, 8);
+      stats.mismatch_g2388 += differs(0x2388, snapshot->g2388, 24);
+      stats.mismatch_bool += differs(0x4900, snapshot->bool_consts, 40);
+      stats.mismatch_wofs += differs(0x2080, &snapshot->window_offset, 1);
+      ++stats.verified;
+    }
+
+    // No backend hooks writes to 0x2000-0x23FF, so those groups are copied straight in. The constant
+    // groups go through WriteRegistersFromMem one changed run at a time: the backend marks its
+    // cbuffers, textures and vertex buffers dirty once per run instead of once per dword, and only
+    // changed fetch slots are touched, since a fetch write invalidates that slot's cached resources.
+    const bool timing = REXCVAR_GET(gpu_native_frontend_timing);
+    const uint64_t apply_start = timing ? rex::chrono::Clock::QueryHostTickCount() : 0;
+    uint32_t* const values = register_file_->values;
+    auto copy =[values](uint32_t first, const uint32_t* source, uint32_t n) {
+      std::memcpy(values + first, source, n * sizeof(uint32_t));
+    };
+    copy(0x2000, snapshot->surf, 6);
+    copy(0x2180, snapshot->prog, 2);
+    copy(0x2200, snapshot->rs, 12);
+    copy(0x2100, snapshot->vp, 21);
+    copy(0x2081, snapshot->scissor, 2);
+    copy(0x2080, &snapshot->window_offset, 1);
+    copy(0x2280, snapshot->g2280, 21);
+    copy(0x2300, snapshot->g2300, 38);
+    copy(0x2380, snapshot->g2380, 8);
+    copy(0x2388, snapshot->g2388, 24);
+
+    uint32_t guest_order[2048];
+    auto write_run = [&](uint32_t first, const uint32_t* const* units, uint32_t unit_dwords,
+                         uint32_t start, uint32_t end) {
+      uint32_t n = 0;
+      for (uint32_t u = start; u < end; ++u) {
+        for (uint32_t i = 0; i < unit_dwords; ++i) {
+          guest_order[n++] = rex::byte_swap(units[u][i]);
+        }
+      }
+      WriteRegistersFromMem(first + start * unit_dwords, guest_order, n);
+    };
+    auto write_changed = [&](uint32_t first, const uint32_t* const* units, uint32_t unit_dwords,
+                             uint32_t unit_count) {
+      uint32_t run_start = unit_count;
+      for (uint32_t u = 0; u <= unit_count; ++u) {
+        bool changed = u < unit_count && units[u] &&
+                       std::memcmp(values + first + u * unit_dwords, units[u],
+                                   unit_dwords * sizeof(uint32_t)) != 0;
+        if (changed && run_start == unit_count) {
+          run_start = u;
+        } else if (!changed && run_start != unit_count) {
+          write_run(first, units, unit_dwords, run_start, u);
+          run_start = unit_count;
+        }
+      }
+    };
+    const uint32_t* fetch_slots[32];
+    for (uint32_t i = 0; i < 32; ++i) {
+      fetch_slots[i] = snapshot->fetch + 6 * i;
+    }
+    write_changed(0x4800, fetch_slots, 6, 32);
+    write_changed(0x4000, snapshot->alu, 16, 128);
+    const uint32_t* bool_loop = snapshot->bool_consts;
+    write_changed(0x4900, &bool_loop, 40, 1);
+
+    const uint64_t shader_start = timing ? rex::chrono::Clock::QueryHostTickCount() : 0;
+    // With the library's shader packets turned into NOPs, the snapshot names the shaders; otherwise
+    // those packets already loaded them.
+    if (snapshot->flags & native_frontend::kSnapshotFlagShaders) {
+      auto load = [this](xenos::ShaderType type, uint32_t guest_address, uint32_t dwords) {
+        return LoadShader(type, guest_address,
+                          memory_->TranslatePhysical<uint32_t*>(guest_address), dwords);
+      };
+      auto load_cached = [&](xenos::ShaderType type, uint32_t guest_address, uint32_t dwords) {
+        NativeShaderLoad& last = g_native_shader_loads[uint32_t(type)];
+        if (last.valid && last.guest_address == guest_address && last.size_dwords == dwords) {
+          ++stats.shader_load_skipped;
+          return;
+        }
+        ++stats.shader_loads;
+        last.valid = LoadShaderFromMemory(load, active_vertex_shader_, active_pixel_shader_, type,
+                                          guest_address, dwords);
+        last.guest_address = guest_address;
+        last.size_dwords = dwords;
+      };
+      load_cached(xenos::ShaderType::kVertex, snapshot->vs_address, snapshot->vs_dwords);
+      if (snapshot->ps_dwords) {
+        load_cached(xenos::ShaderType::kPixel, snapshot->ps_address, snapshot->ps_dwords);
+      }
+    }
+
+    const uint64_t issue_start = timing ? rex::chrono::Clock::QueryHostTickCount() : 0;
+    ++stats.draws;
+    g_decoded_draw_words = snapshot->draw_words;
+    bool result;
+    if (snapshot->draw_opcode == native_frontend::kDrawOpcodeIndx2) {
+      ++stats.draws_indx2;
+      result = ExecutePacketType3_DRAW_INDX_2(nullptr, packet, snapshot->draw_word_count);
+    } else {
+      result = ExecutePacketType3_DRAW_INDX(nullptr, packet, 4);
+    }
+    g_decoded_draw_words = nullptr;
+    if (timing) {
+      const uint64_t issue_end = rex::chrono::Clock::QueryHostTickCount();
+      ++stats.timed_draws;
+      stats.apply_ticks += shader_start - apply_start;
+      stats.shader_ticks += issue_start - shader_start;
+      stats.issue_ticks += issue_end - issue_start;
+    }
+    return result;
+  }
+
   // skip N 32-bit words to get to the next packet
   // No-op, ignore some data.
-  reader->AdvanceRead(count * sizeof(uint32_t));
+  reader->AdvanceRead((count - words_read) * sizeof(uint32_t));
   return true;
 }
 
@@ -959,6 +1569,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  ReportNativeFrontendOnSwap();
 
   ++counter_;
   return true;
@@ -1290,6 +1901,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // uint32_t viz_id = viz_query_condition & 0x3F;
   // when true, render conditionally based on query result
   // uint32_t viz_use = viz_query_condition & 0x100;
+  // A null reader is a native front end draw: the words come decoded from g_decoded_draw_words.
 
   assert_not_zero(count_remaining);
   if (!count_remaining) {
@@ -1297,7 +1909,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
     return false;
   }
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
-  vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
+  vgt_draw_initiator.value = ReadDrawWord(reader);
   --count_remaining;
   WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
 
@@ -1319,7 +1931,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
         REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
         return false;
       }
-      uint32_t vgt_dma_base = reader->ReadAndSwap<uint32_t>();
+      uint32_t vgt_dma_base = ReadDrawWord(reader);
       --count_remaining;
       WriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
       reg::VGT_DMA_SIZE vgt_dma_size;
@@ -1328,7 +1940,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
         REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_SIZE", opcode_name);
         return false;
       }
-      vgt_dma_size.value = reader->ReadAndSwap<uint32_t>();
+      vgt_dma_size.value = ReadDrawWord(reader);
       --count_remaining;
       WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
 
@@ -1366,7 +1978,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
   // Skip to the next command, for example, if there are immediate indexes that
   // we don't support yet.
-  reader->AdvanceRead(count_remaining * sizeof(uint32_t));
+  SkipDrawWords(reader, count_remaining);
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
@@ -1378,7 +1990,16 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+      // gpu_native: a native renderer draws from the game's Direct3D calls instead; IssueDraw also
+      // runs the resolves (EDRAM copy mode), so skipping it skips all EDRAM work.
+      MsaaFillAt1x msaa_fill_at_1x(*register_file_);
+      if ((REXCVAR_GET(gpu_msaa_fill_at_1x) || REXCVAR_GET(gpu_native_surfaces)) &&
+          IsMsaaFillAt1xEligible(*register_file_, active_vertex_shader_, active_pixel_shader_)) {
+        msaa_fill_at_1x.Apply();
+        ReportMsaaFillAt1x();
+      }
+      draw_succeeded = REXCVAR_GET(gpu_native) ||
+                       IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {
         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
@@ -1414,7 +2035,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, 
     REXGPU_ERROR("PM4_DRAW_INDX: Packet too small, can't read the viz query token");
     return false;
   }
-  uint32_t viz_query_condition = reader->ReadAndSwap<uint32_t>();
+  uint32_t viz_query_condition = ReadDrawWord(reader);
   --count_remaining;
   return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX", viz_query_condition,
                                 count_remaining);
@@ -1424,7 +2045,7 @@ bool CommandProcessor::ExecutePacketType3_DRAW_INDX_2(memory::RingBuffer* reader
                                                       uint32_t count) {
   // "draw using supplied indices in packet"
   // Generally used by Xbox 360 Direct3D 9 for kAutoIndex source.
-  // No viz query token.
+  // No viz query token. A null reader is a native front end draw (see ExecutePacketType3Draw).
   return ExecutePacketType3Draw(reader, packet, "PM4_DRAW_INDX_2", 0, count);
 }
 
@@ -1524,20 +2145,13 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  auto shader =
-      LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
-  switch (shader_type) {
-    case xenos::ShaderType::kVertex:
-      active_vertex_shader_ = shader;
-      break;
-    case xenos::ShaderType::kPixel:
-      active_pixel_shader_ = shader;
-      break;
-    default:
-      assert_unhandled_case(shader_type);
-      return false;
-  }
-  return true;
+  ResetNativeShaderLoads();
+  return LoadShaderFromMemory(
+      [this](xenos::ShaderType type, uint32_t guest_address, uint32_t dwords) {
+        return LoadShader(type, guest_address,
+                          memory_->TranslatePhysical<uint32_t*>(guest_address), dwords);
+      },
+      active_vertex_shader_, active_pixel_shader_, shader_type, addr, size_dwords);
 }
 
 bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* reader,
@@ -1554,14 +2168,17 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   assert_true(start == 0);
   assert_true(reader->read_count() >= size_dwords * 4);
   assert_true(count - 2 >= size_dwords);
+  ResetNativeShaderLoads();
   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
   switch (shader_type) {
     case xenos::ShaderType::kVertex:
       active_vertex_shader_ = shader;
+      g_vertex_shader_embedded = true;
       break;
     case xenos::ShaderType::kPixel:
       active_pixel_shader_ = shader;
+      g_pixel_shader_embedded = true;
       break;
     default:
       assert_unhandled_case(shader_type);

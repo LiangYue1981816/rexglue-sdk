@@ -43,8 +43,15 @@ REXCVAR_DECLARE(bool, native_2x_msaa);
 REXCVAR_DECLARE(bool, snorm16_render_target_full_range);
 REXCVAR_DECLARE(bool, mrt_edram_used_range_clamp_to_min);
 REXCVAR_DECLARE(bool, direct_host_resolve);
+REXCVAR_DECLARE(bool, gpu_native_surfaces);
+REXCVAR_DECLARE(bool, gpu_native_resolves);
+REXCVAR_DECLARE(bool, gpu_native_hook_example);
 
 // GPU Textures
+REXCVAR_DECLARE(bool, texture_dump);
+REXCVAR_DECLARE(std::string, texture_pack_dir);
+REXCVAR_DECLARE(bool, texture_replace);
+REXCVAR_DECLARE(bool, texture_replace_allow_larger);
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);

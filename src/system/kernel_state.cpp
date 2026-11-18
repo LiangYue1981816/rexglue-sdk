@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
@@ -16,6 +17,7 @@
 
 #include <fmt/format.h>
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/image_info.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -33,6 +35,7 @@
 
 #include <rex/system/flags.h>
 #include <rex/system/guest_path.h>
+#include <rex/system/system_link.h>
 #include <rex/system/user_module.h>
 #include <rex/system/xevent.h>
 #include <rex/system/xmodule.h>
@@ -42,6 +45,8 @@
 #include <rex/system/xsemaphore.h>
 #include <rex/system/xthread.h>
 #include <rex/system/xtimer.h>
+
+REXCVAR_DECLARE(uint32_t, local_users);  // defined in system_link_settings.cpp
 
 namespace rex::system {
 
@@ -73,6 +78,17 @@ KernelState::KernelState(Runtime* emulator)
     user_data_root = std::filesystem::absolute(user_data_root);
   }
   content_manager_ = std::make_unique<xam::ContentManager>(this, user_data_root);
+  user_profile_->LoadNetworkIdentity(user_data_root);
+
+  // Players 2-4 (split-screen) are derived from the primary profile once its identity is loaded.
+  const auto player_count = std::clamp<uint32_t>(REXCVAR_GET(local_users), 1, 4);
+  for (uint32_t user_index = 1; user_index < player_count; ++user_index) {
+    auto profile = std::make_unique<xam::UserProfile>(*user_profile_, user_index);
+    profile->set_kernel_state(this);
+    REXSYS_INFO("Local player {}: XUID {}, gamertag '{}'", user_index + 1,
+                system_link::FormatXuid(profile->network_xuid()), profile->gamertag());
+    extra_user_profiles_.push_back(std::move(profile));
+  }
 
   if (shared_kernel_state_ != nullptr) {
     REXSYS_ERROR("KernelState constructed but shared_kernel_state_ already set");
@@ -1097,8 +1113,8 @@ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
     listener->EnqueueNotification(0x00000009, 1);
     listener->EnqueueNotification(0x00000009, 0);
     // XN_SYS_SIGNINCHANGED x2
-    listener->EnqueueNotification(0x0000000A, 1);
-    listener->EnqueueNotification(0x0000000A, 1);
+    listener->EnqueueNotification(0x0000000A, signed_in_user_mask());
+    listener->EnqueueNotification(0x0000000A, signed_in_user_mask());
     // XN_SYS_INPUTDEVICESCHANGED x2
     listener->EnqueueNotification(0x00000012, 0);
     listener->EnqueueNotification(0x00000012, 0);

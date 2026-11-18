@@ -11,15 +11,19 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
 
 #include <SPIRV/GLSL.std.450.h>
+#include <fmt/format.h>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
@@ -36,6 +40,7 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
+#include "pass_timing.h"
 
 REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
@@ -206,7 +211,13 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
       device_properties.fragmentStoresAndAtomics && device_properties.sampleRateShading &&
       device_properties.standardSampleLocations &&
       shared_memory_binding_count < device_properties.maxPerStageDescriptorStorageBuffers;
-  if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
+  if (REXCVAR_GET(gpu_native_surfaces)) {
+    path_ = Path::kHostRenderTargets;
+    if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
+      REXGPU_INFO(
+          "NATIVESURF host render targets forced (render_target_path_vulkan = fsi ignored)");
+    }
+  } else if (REXCVAR_GET(render_target_path_vulkan) == "fsi") {
     path_ = Path::kPixelShaderInterlock;
   } else {
     path_ = Path::kHostRenderTargets;
@@ -1140,6 +1151,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
     return false;
   }
 
+#if REX_PLATFORM_ANDROID
+  TraceAndroidResolve(resolve_info);
+#endif
   // Nothing to copy/clear.
   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
     return true;
@@ -1180,7 +1194,8 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
           uint32_t dump_row_length_used;
           uint32_t dump_rows;
           uint32_t dump_pitch;
-          resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+          GetResolveCopyEdramTileSpan(resolve_info, dump_base, dump_row_length_used, dump_rows,
+                                      dump_pitch);
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for resolve");
             return false;
@@ -1283,11 +1298,27 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 sizeof(copy_shader_constants), &copy_shader_constants);
           }
           command_processor_.SubmitBarriers(true);
+          SetDispatchSource(DispatchSource::kResolve);
           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+          PassTimingDispatchRecorded();
+
+          // gpu_native_resolves: the textures viewing the destination that are up to date now
+          // stay up to date if the resolved region is also copied into them on the host.
+          const bool native_resolve =
+              REXCVAR_GET(gpu_native_resolves) && REXCVAR_GET(gpu_native_surfaces) &&
+              GetPath() == Path::kHostRenderTargets && IsNativeResolveEligible(resolve_info);
+          if (native_resolve) {
+            // From the base, which may be before the extent start, for the textures at the base.
+            texture_cache.CaptureUpToDateBeforeResolve(resolve_info.copy_dest_base,
+                                                       copy_dest_range_unscaled);
+          }
 
           // Invalidate textures and mark the range as scaled if needed.
           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
                                             resolve_info.copy_dest_extent_length);
+          if (native_resolve) {
+            WriteResolveToTextures(resolve_info, texture_cache);
+          }
           written_address_out = resolve_info.copy_dest_extent_start;
           written_length_out = resolve_info.copy_dest_extent_length;
           copied = true;
@@ -1342,7 +1373,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                                             VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                             sizeof(depth_clear_constants), &depth_clear_constants);
           command_processor_.SubmitBarriers(true);
+          SetDispatchSource(DispatchSource::kRtClear);
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+          PassTimingDispatchRecorded();
         }
         if (clear_color) {
           command_processor_.BindExternalComputePipeline(
@@ -1362,7 +1395,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
                 sizeof(color_clear_constants), &color_clear_constants);
           }
           command_processor_.SubmitBarriers(true);
+          SetDispatchSource(DispatchSource::kRtClear);
           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+          PassTimingDispatchRecorded();
         }
         MarkEdramBufferModified();
         cleared = true;
@@ -1478,6 +1513,7 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
         VkImageLayout rt_new_layout;
         VulkanRenderTarget::GetDrawUsage(i == 0, &rt_dst_stage_mask, &rt_dst_access_mask,
                                          &rt_new_layout);
+        SetBarrierSource(BarrierSource::kRenderTarget);
         command_processor_.PushImageMemoryBarrier(
             vulkan_rt.image(),
             ui::vulkan::util::InitializeSubresourceRange(
@@ -1900,6 +1936,11 @@ RenderTargetCache::RenderTarget* VulkanRenderTargetCache::CreateRenderTarget(Ren
       image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
     }
     image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    if (REXCVAR_GET(gpu_native_resolves)) {
+      // Source of vkCmdCopyImage in WriteResolveToTextures. The cvar requires a restart, so all
+      // color render targets have it while native resolves are enabled.
+      image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
   }
   if (image_create_info.format == VK_FORMAT_UNDEFINED) {
     REXGPU_ERROR("VulkanRenderTargetCache: Unknown {} render target format {}",
@@ -2139,6 +2180,7 @@ void VulkanRenderTargetCache::UseEdramBuffer(EdramBufferUsage new_usage) {
   VkAccessFlags src_access_mask, dst_access_mask;
   GetEdramBufferUsageMasks(edram_buffer_usage_, src_stage_mask, src_access_mask);
   GetEdramBufferUsageMasks(new_usage, dst_stage_mask, dst_access_mask);
+  SetBarrierSource(BarrierSource::kRenderTarget);
   if (command_processor_.PushBufferMemoryBarrier(edram_buffer_, 0, VK_WHOLE_SIZE, src_stage_mask,
                                                  dst_stage_mask, src_access_mask,
                                                  dst_access_mask)) {
@@ -2195,6 +2237,7 @@ void VulkanRenderTargetCache::CommitEdramBufferShaderWrites(
     PixelShaderInterlockFullEdramBarrierPlaced();
     return;
   }
+  SetBarrierSource(BarrierSource::kRenderTarget);
   command_processor_.PushBufferMemoryBarrier(
       edram_buffer_, 0, VK_WHOLE_SIZE, stage_mask, stage_mask, access_mask, access_mask,
       VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
@@ -4020,14 +4063,19 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(spv::OpUMod, type_uint, host_depth_source_tile_index,
                                     host_depth_source_pitch_tiles);
             // Finally calculate the host depth source texture coordinates.
+            // The host depth source has its own sample count (as in the D3D12 transfer shader).
+            const uint32_t host_depth_tile_width_samples =
+                tile_width_samples >>
+                uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k4X);
+            const uint32_t host_depth_tile_height_samples =
+                tile_height_samples >>
+                uint32_t(key.host_depth_source_msaa_samples >= xenos::MsaaSamples::k2X);
             spv::Id host_depth_source_pixel_x_int = builder.createUnaryOp(
                 spv::OpBitcast, type_int,
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_width_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k4X)),
+                                        builder.makeUintConstant(host_depth_tile_width_samples),
                                         host_depth_source_tile_index_x),
                     host_depth_source_tile_pixel_x));
             spv::Id host_depth_source_pixel_y_int = builder.createUnaryOp(
@@ -4035,9 +4083,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
                 builder.createBinOp(
                     spv::OpIAdd, type_uint,
                     builder.createBinOp(spv::OpIMul, type_uint,
-                                        builder.makeUintConstant(tile_height_samples >>
-                                                                 uint32_t(key.source_msaa_samples >=
-                                                                          xenos::MsaaSamples::k2X)),
+                                        builder.makeUintConstant(host_depth_tile_height_samples),
                                         host_depth_source_tile_index_y),
                     host_depth_source_tile_pixel_y));
             // Load the host depth source.
@@ -4546,6 +4592,75 @@ VkPipeline const* VulkanRenderTargetCache::GetTransferPipelines(TransferPipeline
   return transfer_pipelines_.emplace(key, pipelines).first->second.data();
 }
 
+#if REX_PLATFORM_ANDROID
+// "key 0123ABCD base 0 pitch 16 msaa 0 depth fmt 1"
+std::string VulkanRenderTargetCache::DescribeAndroidRenderTarget(
+    const RenderTarget* render_target) {
+  if (!render_target) {
+    return "-";
+  }
+  const RenderTargetKey key = render_target->key();
+  return fmt::format("key {:08X} base {} pitch {} msaa {} {} fmt {}", key.key,
+                     uint32_t(key.base_tiles), uint32_t(key.pitch_tiles_at_32bpp),
+                     uint32_t(key.msaa_samples), key.is_depth ? "depth" : "color",
+                     uint32_t(key.resource_format));
+}
+
+void VulkanRenderTargetCache::TraceAndroidTransfersAndResolveClears(
+    uint32_t render_target_count, RenderTarget* const* render_targets,
+    const std::vector<Transfer>* render_target_transfers,
+    const uint64_t* render_target_resolve_clear_values,
+    const Transfer::Rectangle* resolve_clear_rectangle) {
+  if (!command_processor_.IsAndroidFrameTraceActive()) {
+    return;
+  }
+  const uint32_t next_draw = command_processor_.android_frame_draw_index();
+  for (uint32_t i = 0; i < render_target_count; ++i) {
+    RenderTarget* dest = render_targets[i];
+    if (!dest) {
+      continue;
+    }
+    for (const Transfer& transfer : render_target_transfers[i]) {
+      REXGPU_INFO("FRAMETRACE-RT @{} transfer tiles {}-{} to [{}] from [{}] host_depth [{}]",
+                  next_draw, transfer.start_tiles, transfer.end_tiles,
+                  DescribeAndroidRenderTarget(dest), DescribeAndroidRenderTarget(transfer.source),
+                  DescribeAndroidRenderTarget(transfer.host_depth_source));
+    }
+    if (render_target_resolve_clear_values && resolve_clear_rectangle) {
+      REXGPU_INFO("FRAMETRACE-RT @{} resolve-clear [{}] value {:016X} rect {},{} {}x{}", next_draw,
+                  DescribeAndroidRenderTarget(dest), render_target_resolve_clear_values[i],
+                  resolve_clear_rectangle->x_pixels, resolve_clear_rectangle->y_pixels,
+                  resolve_clear_rectangle->width_pixels, resolve_clear_rectangle->height_pixels);
+    }
+  }
+}
+
+void VulkanRenderTargetCache::TraceAndroidResolve(const draw_util::ResolveInfo& resolve_info) const {
+  if (!command_processor_.IsAndroidFrameTraceActive()) {
+    return;
+  }
+  const RegisterFile& regs = register_file();
+  const auto copy_dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
+  const auto copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
+  REXGPU_INFO(
+      "FRAMETRACE-RT @{} resolve copy_control {:08X} src {} command {} | dest_info {:08X} fmt {} "
+      "base {:08X} pitch {} height {} extent {:08X}+{} | clear depth {} {:08X} color {} "
+      "{:08X}{:08X} | edram depth base {} color base {} | size {}x{}",
+      command_processor_.android_frame_draw_index(), resolve_info.rb_copy_control.value,
+      uint32_t(resolve_info.rb_copy_control.copy_src_select),
+      uint32_t(resolve_info.rb_copy_control.copy_command), copy_dest_info.value,
+      uint32_t(copy_dest_info.copy_dest_format),
+      regs.Get<uint32_t>(XE_GPU_REG_RB_COPY_DEST_BASE),
+      uint32_t(copy_dest_pitch.copy_dest_pitch), uint32_t(copy_dest_pitch.copy_dest_height),
+      resolve_info.copy_dest_extent_start, resolve_info.copy_dest_extent_length,
+      resolve_info.IsClearingDepth() ? "on" : "off", resolve_info.rb_depth_clear,
+      resolve_info.IsClearingColor() ? "on" : "off", resolve_info.rb_color_clear,
+      resolve_info.rb_color_clear_lo, resolve_info.depth_original_base,
+      resolve_info.color_original_base, uint32_t(resolve_info.coordinate_info.width_div_8) * 8,
+      resolve_info.height_div_8 * 8);
+}
+#endif
+
 void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     uint32_t render_target_count, RenderTarget* const* render_targets,
     const std::vector<Transfer>* render_target_transfers,
@@ -4557,6 +4672,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+#if REX_PLATFORM_ANDROID
+  TraceAndroidTransfersAndResolveClears(render_target_count, render_targets,
+                                        render_target_transfers,
+                                        render_target_resolve_clear_values,
+                                        resolve_clear_rectangle);
+#endif
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
@@ -4622,6 +4743,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         UseEdramBuffer(EdramBufferUsage::kComputeWrite);
         // Always transitioning both depth and stencil, not storing separate
         // usage flags for depth and stencil.
+        SetBarrierSource(BarrierSource::kRenderTarget);
         command_processor_.PushImageMemoryBarrier(
             dest_vulkan_rt.image(),
             ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
@@ -4635,8 +4757,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       }
       Transfer::Rectangle transfer_rectangles[Transfer::kMaxRectanglesWithCutout];
       uint32_t transfer_rectangle_count = transfer.GetRectangles(
-          dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp, dest_rt_key.msaa_samples, false,
-          transfer_rectangles, resolve_clear_rectangle);
+          edram_tile_count(), dest_rt_key.base_tiles, dest_rt_key.pitch_tiles_at_32bpp,
+          dest_rt_key.msaa_samples, false, transfer_rectangles, resolve_clear_rectangle);
       assert_not_zero(transfer_rectangle_count);
       HostDepthStoreRectangleConstant host_depth_store_rectangle_constant;
       for (uint32_t j = 0; j < transfer_rectangle_count; ++j) {
@@ -4649,7 +4771,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
         command_processor_.SubmitBarriers(true);
+        SetDispatchSource(DispatchSource::kDepthStore);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+        PassTimingDispatchRecorded();
         MarkEdramBufferModified();
       }
     }
@@ -4693,6 +4817,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       VkAccessFlags dest_dst_access_mask;
       VkImageLayout dest_new_layout;
       dest_vulkan_rt.GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask, &dest_new_layout);
+      SetBarrierSource(BarrierSource::kRenderTarget);
       command_processor_.PushImageMemoryBarrier(
           dest_vulkan_rt.image(),
           ui::vulkan::util::InitializeSubresourceRange(
@@ -4723,6 +4848,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       }
       if (!source_previously_used_as_dest) {
         auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(transfer.source);
+        SetBarrierSource(BarrierSource::kRenderTarget);
         command_processor_.PushImageMemoryBarrier(
             source_vulkan_rt.image(),
             ui::vulkan::util::InitializeSubresourceRange(
@@ -4740,6 +4866,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
           !host_depth_source_previously_used_as_dest) {
         auto& host_depth_source_vulkan_rt =
             *static_cast<VulkanRenderTarget*>(transfer.host_depth_source);
+        SetBarrierSource(BarrierSource::kRenderTarget);
         command_processor_.PushImageMemoryBarrier(
             host_depth_source_vulkan_rt.image(),
             ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
@@ -4789,6 +4916,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
       VkAccessFlags dest_dst_access_mask;
       VkImageLayout dest_new_layout;
       dest_vulkan_rt.GetDrawUsage(&dest_dst_stage_mask, &dest_dst_access_mask, &dest_new_layout);
+      SetBarrierSource(BarrierSource::kRenderTarget);
       command_processor_.PushImageMemoryBarrier(
           dest_vulkan_rt.image(),
           ui::vulkan::util::InitializeSubresourceRange(
@@ -4894,8 +5022,8 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                                ? TransferMode::kDepthToStencilBit
                                                : TransferMode::kColorToStencilBit;
             stencil_clear_rectangle_count += transfer.GetRectangles(
-                dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-                nullptr, resolve_clear_rectangle);
+                edram_tile_count(), dest_rt_key.base_tiles, dest_pitch_tiles,
+                dest_rt_key.msaa_samples, dest_is_64bpp, nullptr, resolve_clear_rectangle);
           } else {
             if (dest_rt_key.is_depth) {
               if (host_depth_source_vulkan_rt) {
@@ -4929,6 +5057,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
            it != current_transfer_invocations_.cend(); ++it) {
         assert_not_null(it->transfer.source);
         auto& source_vulkan_rt = *static_cast<VulkanRenderTarget*>(it->transfer.source);
+        SetBarrierSource(BarrierSource::kRenderTarget);
         command_processor_.PushImageMemoryBarrier(
             source_vulkan_rt.image(),
             ui::vulkan::util::InitializeSubresourceRange(
@@ -4949,6 +5078,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             UseEdramBuffer(EdramBufferUsage::kFragmentRead);
           } else {
             // Reading host depth from the texture.
+            SetBarrierSource(BarrierSource::kRenderTarget);
             command_processor_.PushImageMemoryBarrier(
                 host_depth_source_vulkan_rt->image(),
                 ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_DEPTH_BIT |
@@ -4979,9 +5109,10 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         stencil_clear_attachment->clearValue.depthStencil.stencil = 0;
         for (const Transfer& transfer : current_transfers) {
           Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
-          uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              transfer_stencil_clear_rectangles, resolve_clear_rectangle);
+          uint32_t transfer_stencil_clear_rectangle_count =
+              transfer.GetRectangles(edram_tile_count(), dest_rt_key.base_tiles, dest_pitch_tiles,
+                                     dest_rt_key.msaa_samples, dest_is_64bpp,
+                                     transfer_stencil_clear_rectangles, resolve_clear_rectangle);
           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count; ++j) {
             const Transfer::Rectangle& stencil_clear_rectangle =
                 transfer_stencil_clear_rectangles[j];
@@ -5028,16 +5159,16 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         // Will be merging transfers from the same source into one mesh.
         auto it_merged_first = it, it_merged_last = it;
         uint32_t transfer_rectangle_count = transfer_invocation_first.transfer.GetRectangles(
-            dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-            nullptr, resolve_clear_rectangle);
+            edram_tile_count(), dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples,
+            dest_is_64bpp, nullptr, resolve_clear_rectangle);
         for (auto it_merge = std::next(it_merged_first);
              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
             break;
           }
           transfer_rectangle_count += it_merge->transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              nullptr, resolve_clear_rectangle);
+              edram_tile_count(), dest_rt_key.base_tiles, dest_pitch_tiles,
+              dest_rt_key.msaa_samples, dest_is_64bpp, nullptr, resolve_clear_rectangle);
           it_merged_last = it_merge;
         }
         assert_not_zero(transfer_rectangle_count);
@@ -5075,8 +5206,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
         for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
-              dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
-              transfer_invocation_rectangles, resolve_clear_rectangle);
+              edram_tile_count(), dest_rt_key.base_tiles, dest_pitch_tiles,
+              dest_rt_key.msaa_samples, dest_is_64bpp, transfer_invocation_rectangles,
+              resolve_clear_rectangle);
           assert_not_zero(transfer_invocation_rectangle_count);
           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
@@ -5563,7 +5695,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       builder.createAccessChain(spv::StorageClassPushConstant, push_constants, id_vector_temp),
       spv::NoPrecision);
   spv::Id const_edram_base_tiles_bits_plus_1 =
-      builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1);
+      builder.makeUintConstant(xenos::kEdramVirtualBaseTilesBits + 1);
   spv::Id edram_tile_index_non_wrapped =
       builder.createBinOp(spv::OpIAdd, type_uint,
                           builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
@@ -5604,7 +5736,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
       spv::OpISub, type_uint, edram_tile_index_non_wrapped,
       builder.createTriOp(spv::OpBitFieldUExtract, type_uint, offsets_constant,
                           const_edram_base_tiles_bits_plus_1,
-                          builder.makeUintConstant(xenos::kEdramBaseTilesBits)));
+                          builder.makeUintConstant(xenos::kEdramVirtualBaseTilesBits)));
   // Split the linear tile index in the source texture into X and Y in tiles.
   spv::Id source_pitch_tiles =
       builder.createTriOp(spv::OpBitFieldUExtract, type_uint, pitches_constant,
@@ -5986,7 +6118,7 @@ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInf
   uint32_t dump_row_length_used;
   uint32_t dump_rows;
   uint32_t dump_pitch;
-  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  GetResolveCopyEdramTileSpan(resolve_info, dump_base, dump_row_length_used, dump_rows, dump_pitch);
   GetResolveCopyDispatchesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
                                  dump_rectangles_, direct_resolve_dispatches_);
   if (direct_resolve_dispatches_.empty()) {
@@ -6041,6 +6173,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
     auto& vulkan_rt = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
     RenderTargetKey rt_key = vulkan_rt.key();
+    SetBarrierSource(BarrierSource::kRenderTarget);
     command_processor_.PushImageMemoryBarrier(
         vulkan_rt.image(),
         ui::vulkan::util::InitializeSubresourceRange(
@@ -6136,6 +6269,7 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
                                           sizeof(last_offsets), &last_offsets);
       }
       command_processor_.SubmitBarriers(true);
+      SetDispatchSource(DispatchSource::kRtTransfer);
       command_buffer.CmdVkDispatch(
           (draw_resolution_scale_x() *
                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
@@ -6146,10 +6280,336 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
            (kDumpSamplesPerGroupY - 1)) /
               kDumpSamplesPerGroupY,
           1);
+      PassTimingDispatchRecorded();
     }
     MarkEdramBufferModified();
   }
   return all_pipelines_available;
+}
+
+const char* const
+    VulkanRenderTargetCache::kNativeResolveFallbackNames[size_t(NativeResolveFallback::kCount)] = {
+        "depth",
+        "msaa",
+        "exp_bias",
+        "swap",
+        "no_source",
+        "multiple_sources",
+        "partial_source",
+        "source_format",
+        "dest_format",
+        "dest_array",
+        "dest_base_adjusted",
+        "endian",
+        "half_pixel_fill",
+        "source_placement",
+        "texture_incompatible",
+        "texture_not_up_to_date",
+        "texture_replacement",
+        "texture_outside",
+        "texture_no_uav",
+        "no_pipeline",
+        "descriptors",
+        "texture_no_storage_format",
+        "image_view",
+        "copy_format",
+};
+
+const char* const
+    VulkanRenderTargetCache::kNativeResolvePairNames[size_t(NativeResolvePair::kCount)] = {
+        "7>32", "6>31", "3>32", "0>6", "d0>22", "d1>23",
+};
+
+bool VulkanRenderTargetCache::IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info) {
+  // Depth resolves are copies of the depth (the swap and the exponent bias don't apply to them),
+  // the exponent bias is applied by native_resolve_*_cs to floating-point color only, and red and
+  // blue are swapped by it for k_8_8_8_8 only.
+  const bool is_depth = resolve_info.IsCopyingDepth();
+  const auto source_color_format = xenos::GetStorageColorFormat(
+      xenos::ColorRenderTargetFormat(resolve_info.color_edram_info.format));
+  NativeResolveFallback reason;
+  if ((is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info).msaa_samples !=
+      xenos::MsaaSamples::k1X) {
+    reason = NativeResolveFallback::kMsaa;
+  } else if (!is_depth && resolve_info.copy_dest_info.copy_dest_exp_bias != 0 &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_16_16_FLOAT &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
+    reason = NativeResolveFallback::kExpBias;
+  } else if (!is_depth && resolve_info.copy_dest_info.copy_dest_swap != 0 &&
+             source_color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+    reason = NativeResolveFallback::kSwap;
+  } else {
+    return true;
+  }
+  CountNativeResolveFallback(reason);
+  ReportNativeResolves();
+  return false;
+}
+
+void VulkanRenderTargetCache::WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+                                                     VulkanTextureCache& texture_cache) {
+  auto fallback = [this](NativeResolveFallback reason) {
+    CountNativeResolveFallback(reason);
+    ReportNativeResolves();
+  };
+
+  // Only resolves whose result is the render target data as is (copied), or the render target
+  // data with the exponent bias applied, red and blue swapped, or the depth taken from a depth
+  // render target (written by native_resolve_*_cs), in the host representation of the
+  // destination format in the texture cache.
+  const bool is_depth = resolve_info.IsCopyingDepth();
+  const draw_util::ResolveEdramInfo& edram_info =
+      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
+  const int32_t exp_bias = resolve_info.copy_dest_info.copy_dest_exp_bias;
+  const bool swap_red_blue = resolve_info.copy_dest_info.copy_dest_swap != 0;
+  // Only with resolution scaling. The fill is done by native_resolve_*_cs, so copied pairs are
+  // written by it with the identity (kScale by 1) instead.
+  const bool fill_half_pixel_offset = edram_info.fill_half_pixel_offset != 0;
+  VulkanTextureCache::NativeResolveWrite write;
+  NativeResolvePair pair;
+  xenos::TextureFormat texture_format;
+  // RenderTargetKey::resource_format of the source.
+  uint32_t source_resource_format = edram_info.format;
+  if (is_depth) {
+    // The depth aspect view of the render target (D24_UNORM_S8_UINT or D32_SFLOAT_S8_UINT) is
+    // sampled into the R32_SFLOAT texture. The exponent bias and the swap don't apply.
+    const auto source_format = xenos::DepthRenderTargetFormat(edram_info.format);
+    if (source_format == xenos::DepthRenderTargetFormat::kD24S8) {
+      pair = NativeResolvePair::kD24S8;
+      texture_format = xenos::TextureFormat::k_24_8;
+    } else if (source_format == xenos::DepthRenderTargetFormat::kD24FS8) {
+      pair = NativeResolvePair::kD24FS8;
+      texture_format = xenos::TextureFormat::k_24_8_FLOAT;
+      // The host keeps guest float24 depth [0, 2) as [0, 1).
+      write.scale = 2.0f;
+    } else {
+      fallback(NativeResolveFallback::kDepth);
+      return;
+    }
+    write.mode = VulkanTextureCache::NativeResolveMode::kDepthToRed;
+  } else {
+    // The float / unorm view of the render target (not the ownership transfer one, which is
+    // R16G16B16A16_UINT for k_16_16_16_16_FLOAT if supported) is sampled by the shader.
+    const auto source_format =
+        xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(edram_info.format));
+    source_resource_format = uint32_t(source_format);
+    if (source_format == xenos::ColorRenderTargetFormat::k_16_16_16_16_FLOAT) {
+      pair = NativeResolvePair::k16161616Float;
+      texture_format = xenos::TextureFormat::k_16_16_16_16_FLOAT;
+      if (exp_bias || fill_half_pixel_offset) {
+        write.mode = VulkanTextureCache::NativeResolveMode::kScale;
+      }
+    } else if (source_format == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT) {
+      // R16G16B16A16_SFLOAT on the host, but converted to 7e3 by the guest.
+      pair = NativeResolvePair::k2101010FloatTo16161616Float;
+      texture_format = xenos::TextureFormat::k_16_16_16_16_FLOAT;
+      write.mode = VulkanTextureCache::NativeResolveMode::kScale;
+    } else if (source_format == xenos::ColorRenderTargetFormat::k_16_16_FLOAT) {
+      pair = NativeResolvePair::k1616Float;
+      texture_format = xenos::TextureFormat::k_16_16_FLOAT;
+      if (exp_bias || fill_half_pixel_offset) {
+        write.mode = VulkanTextureCache::NativeResolveMode::kScale;
+      }
+    } else if (source_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+      // R8G8B8A8_UNORM render target and texture - copyable without the swap.
+      pair = NativeResolvePair::k8888;
+      texture_format = xenos::TextureFormat::k_8_8_8_8;
+      if (swap_red_blue) {
+        write.mode = VulkanTextureCache::NativeResolveMode::kSwapRedBlue;
+      } else if (fill_half_pixel_offset && !exp_bias) {
+        // Unorm to float to unorm with the scale of 1 round-trips with round-to-nearest stores.
+        write.mode = VulkanTextureCache::NativeResolveMode::kScale;
+      }
+    } else {
+      // Including k_16_16, which the guest stores with a different range than the host.
+      fallback(NativeResolveFallback::kSourceFormat);
+      return;
+    }
+    if (exp_bias && write.mode != VulkanTextureCache::NativeResolveMode::kScale) {
+      fallback(NativeResolveFallback::kExpBias);
+      return;
+    }
+    if (swap_red_blue && write.mode != VulkanTextureCache::NativeResolveMode::kSwapRedBlue) {
+      fallback(NativeResolveFallback::kSwap);
+      return;
+    }
+    // A negative bias is applied the same way.
+    write.scale = std::ldexp(1.0f, exp_bias);
+  }
+  // For depth, ResolveInfo has replaced the destination format with k_24_8 or k_24_8_FLOAT.
+  if (uint32_t(resolve_info.copy_dest_info.copy_dest_format) != uint32_t(texture_format)) {
+    fallback(NativeResolveFallback::kDestFormat);
+    return;
+  }
+  if (resolve_info.copy_dest_info.copy_dest_array) {
+    fallback(NativeResolveFallback::kDestArray);
+    return;
+  }
+  // The destination offsets are relative to the texture base only if the base hasn't been moved
+  // closer to a far resolve origin.
+  if (resolve_info.copy_dest_base != register_file()[XE_GPU_REG_RB_COPY_DEST_BASE] ||
+      (resolve_info.copy_dest_base & 0xFFF) != 0) {
+    fallback(NativeResolveFallback::kDestBaseAdjusted);
+    return;
+  }
+  // Endian128 and Endian share the values of the swaps both have.
+  const uint32_t dest_endian = uint32_t(resolve_info.copy_dest_info.copy_dest_endian);
+  if (dest_endian > uint32_t(xenos::Endian::k16in32)) {
+    fallback(NativeResolveFallback::kEndian);
+    return;
+  }
+  // The resolve shaders replicate the first surely covered host column / row (scale / 2) into the
+  // half-pixel offset gap before it with resolution scaling, so does native_resolve_*_cs. Copied
+  // pairs are left to the resolve, as the copy can't do the fill and the textures of some formats
+  // aren't storage images there.
+  if (fill_half_pixel_offset) {
+    if (write.mode == VulkanTextureCache::NativeResolveMode::kCopy) {
+      fallback(NativeResolveFallback::kHalfPixelFill);
+      return;
+    }
+    write.fill_x = resolve_info.coordinate_info.draw_resolution_scale_x >> 1;
+    write.fill_y = resolve_info.coordinate_info.draw_resolution_scale_y >> 1;
+  }
+
+  // The single render target owning the whole resolve area, as dumped by DumpRenderTargets.
+  uint32_t dump_base;
+  uint32_t dump_row_length_used;
+  uint32_t dump_rows;
+  uint32_t dump_pitch;
+  resolve_info.GetCopyEdramTileSpan(dump_base, dump_row_length_used, dump_rows, dump_pitch);
+  GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                 dump_rectangles_);
+  if (dump_rectangles_.empty()) {
+    fallback(NativeResolveFallback::kNoSource);
+    return;
+  }
+  if (dump_rectangles_.size() != 1) {
+    fallback(NativeResolveFallback::kMultipleSources);
+    return;
+  }
+  const ResolveCopyDumpRectangle& rectangle = dump_rectangles_.front();
+  if (!rectangle.render_target) {
+    fallback(NativeResolveFallback::kNoSource);
+    return;
+  }
+  if (rectangle.row_first != 0 || rectangle.rows != dump_rows || rectangle.row_first_start != 0 ||
+      rectangle.row_last_end != dump_row_length_used) {
+    fallback(NativeResolveFallback::kPartialSource);
+    return;
+  }
+  auto& render_target = *static_cast<VulkanRenderTarget*>(rectangle.render_target);
+  const RenderTargetKey rt_key = render_target.key();
+  if (rt_key.is_depth != is_depth || rt_key.resource_format != source_resource_format) {
+    fallback(NativeResolveFallback::kSourceFormat);
+    return;
+  }
+  if (rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
+    fallback(NativeResolveFallback::kMsaa);
+    return;
+  }
+
+  // The resolve origin in the render target: the resolve EDRAM base tile relative to the render
+  // target's, laid out with the same pitch, plus the offset within that tile.
+  const uint32_t rt_pitch_tiles = rt_key.GetPitchTiles();
+  const uint32_t resolve_base_tiles = edram_info.base_tiles;
+  if (!rt_pitch_tiles || rt_pitch_tiles != edram_info.pitch_tiles ||
+      resolve_base_tiles < rt_key.base_tiles) {
+    fallback(NativeResolveFallback::kSourcePlacement);
+    return;
+  }
+  const uint32_t rt_offset_tiles = resolve_base_tiles - rt_key.base_tiles;
+  const uint32_t tile_width_pixels = xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp());
+  const uint32_t width = resolve_info.coordinate_info.width_div_8 << 3;
+  const uint32_t height = resolve_info.height_div_8 << 3;
+  write.source_x = (rt_offset_tiles % rt_pitch_tiles) * tile_width_pixels +
+                   (resolve_info.coordinate_info.edram_offset_x_div_8 << 3);
+  write.source_y = (rt_offset_tiles / rt_pitch_tiles) * xenos::kEdramTileHeightSamples +
+                   (resolve_info.coordinate_info.edram_offset_y_div_8 << 3);
+  if (!width || !height || write.source_x + width > rt_key.GetWidth() ||
+      write.source_y + height >
+          GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples)) {
+    fallback(NativeResolveFallback::kSourcePlacement);
+    return;
+  }
+  write.base_page = (resolve_info.copy_dest_base & 0x1FFFFFFF) >> 12;
+  write.format = texture_format;
+  // TextureKey::pitch is the fetch constant pitch, in 32-texel units like the aligned resolve one.
+  write.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32;
+  write.endianness = xenos::Endian(dest_endian);
+  write.source = render_target.image();
+  if (is_depth) {
+    write.source_format = GetDepthVulkanFormat(rt_key.GetDepthFormat());
+    write.source_aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+  } else {
+    write.source_format = GetColorVulkanFormat(rt_key.GetColorFormat());
+    write.source_aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+  }
+  // The depth-only view for depth, the view with the image format for color.
+  write.source_view = render_target.view_depth_color();
+  write.dest_x = resolve_info.copy_dest_coordinate_info.offset_x_div_8 << 3;
+  write.dest_y = resolve_info.copy_dest_coordinate_info.offset_y_div_8 << 3;
+  write.width = width;
+  write.height = height;
+
+  // DumpRenderTargets has left the render target in the compute shader read usage. The render
+  // target is left in the usage of the last write, and is transitioned from it by its next user
+  // via VulkanRenderTarget::current_* like after dumping.
+  VulkanTextureCache::NativeResolveSourceUsage source_usage;
+  source_usage.stage_mask = render_target.current_stage_mask();
+  source_usage.access_mask = render_target.current_access_mask();
+  source_usage.layout = render_target.current_layout();
+  VulkanTextureCache::NativeResolveWriteCounts counts;
+  texture_cache.WriteNativeResolveToTextures(write, source_usage, counts);
+  render_target.SetUsage(source_usage.stage_mask, source_usage.access_mask, source_usage.layout);
+
+  native_resolve_written_ += counts.written;
+  native_resolve_written_pairs_[size_t(pair)] += counts.written;
+  CountNativeResolveFallback(NativeResolveFallback::kTextureIncompatible, counts.incompatible);
+  CountNativeResolveFallback(NativeResolveFallback::kTextureNotUpToDate, counts.not_up_to_date);
+  CountNativeResolveFallback(NativeResolveFallback::kTextureReplacement, counts.replacement);
+  CountNativeResolveFallback(NativeResolveFallback::kTextureOutside, counts.outside);
+  CountNativeResolveFallback(NativeResolveFallback::kTextureNoUAV, counts.no_uav);
+  CountNativeResolveFallback(NativeResolveFallback::kNoPipeline, counts.no_pipeline);
+  CountNativeResolveFallback(NativeResolveFallback::kDescriptors, counts.descriptors);
+  CountNativeResolveFallback(NativeResolveFallback::kTextureNoStorageFormat,
+                             counts.no_storage_format);
+  CountNativeResolveFallback(NativeResolveFallback::kImageView, counts.image_view);
+  CountNativeResolveFallback(NativeResolveFallback::kCopyFormat, counts.copy_format);
+  ReportNativeResolves();
+}
+
+void VulkanRenderTargetCache::ReportNativeResolves() {
+  const auto now = std::chrono::steady_clock::now();
+  if (now - native_resolve_last_report_ < std::chrono::seconds(5)) {
+    return;
+  }
+  native_resolve_last_report_ = now;
+  uint64_t fallback_total = 0;
+  std::string fallbacks;
+  for (size_t i = 0; i < size_t(NativeResolveFallback::kCount); ++i) {
+    if (!native_resolve_fallbacks_[i]) {
+      continue;
+    }
+    fallback_total += native_resolve_fallbacks_[i];
+    fallbacks +=
+        fmt::format(" {}={}", kNativeResolveFallbackNames[i], native_resolve_fallbacks_[i]);
+  }
+  // Per source render target format > destination texture format, "d" for depth.
+  std::string written_pairs;
+  for (size_t i = 0; i < size_t(NativeResolvePair::kCount); ++i) {
+    if (native_resolve_written_pairs_[i]) {
+      written_pairs +=
+          fmt::format(" {}={}", kNativeResolvePairNames[i], native_resolve_written_pairs_[i]);
+    }
+  }
+  if (native_resolve_written_ || fallback_total) {
+    REXGPU_INFO("NATIVERESOLVE written {}{} fallback {}{}", native_resolve_written_, written_pairs,
+                fallback_total, fallbacks);
+  }
+  native_resolve_written_ = 0;
+  native_resolve_written_pairs_.fill(0);
+  native_resolve_fallbacks_.fill(0);
 }
 
 }  // namespace rex::graphics::vulkan

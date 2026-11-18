@@ -14,13 +14,38 @@
 #include <cstring>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/math.h>
 
+#include "pass_timing.h"
+#include "render_area.h"
+
+REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, true, "GPU/Vulkan",
+                    "Begin each render pass with a render area that covers only what its draws and "
+                    "clears can write (the scissors in effect at its draws and its clear rectangles) "
+                    "instead of the whole render target, so tile-based GPUs load and store less memory")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics::vulkan {
+
+// Timestamp writes for vulkan_android_pass_timing, encoded as a CmdVkResetQueryPool with this query
+// count so deferred_command_buffer.h (which the game exe is built against) stays unchanged. Must
+// match command_processor.cpp.
+constexpr uint32_t kDeferredWriteTimestampQueryCount = UINT32_MAX;
+namespace {
+PFN_vkCmdWriteTimestamp deferred_write_timestamp = nullptr;
+DeferredGapCounts* deferred_gap_counts = nullptr;
+}  // namespace
+void SetDeferredWriteTimestampFunction(PFN_vkCmdWriteTimestamp function) {
+  deferred_write_timestamp = function;
+}
+void SetDeferredGapCounts(DeferredGapCounts* counts) {
+  deferred_gap_counts = counts;
+}
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
@@ -41,6 +66,66 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
+  DeferredGapCounts* const gap_counts = deferred_gap_counts;
+  VkRect2D scissor = {};
+  bool has_scissor = false;
+
+  // A lambda, not a helper: the command types are private and the header stays unchanged.
+  const auto pass_render_area = [](const uintmax_t* pass_stream, size_t pass_remaining,
+                                   const VkRect2D& full, VkRect2D pass_scissor,
+                                   bool pass_has_scissor) -> VkRect2D {
+    render_area::PassArea area;
+    while (pass_remaining) {
+      const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(pass_stream);
+      pass_stream += kCommandHeaderSizeElements;
+      pass_remaining -= kCommandHeaderSizeElements;
+
+      switch (header.command) {
+        case Command::kVkEndRenderPass:
+        case Command::kVkEndRendering:
+          return render_area::TightRenderArea(area, full);
+
+        case Command::kVkSetScissor: {
+          auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(pass_stream);
+          if (args.first_scissor == 0 && args.scissor_count >= 1) {
+            const VkRect2D* rects = reinterpret_cast<const VkRect2D*>(
+                reinterpret_cast<const uint8_t*>(pass_stream) +
+                rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+            pass_scissor = rects[0];
+            pass_has_scissor = true;
+          }
+          break;
+        }
+
+        case Command::kVkDraw:
+        case Command::kVkDrawIndexed:
+          render_area::AddDraw(area, pass_has_scissor ? &pass_scissor : nullptr);
+          break;
+
+        case Command::kVkClearAttachments: {
+          auto& args = *reinterpret_cast<const ArgsVkClearAttachments*>(pass_stream);
+          size_t offset_bytes =
+              rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
+          offset_bytes = rex::align(offset_bytes + sizeof(VkClearAttachment) * args.attachment_count,
+                                    alignof(VkClearRect));
+          const VkClearRect* rects = reinterpret_cast<const VkClearRect*>(
+              reinterpret_cast<const uint8_t*>(pass_stream) + offset_bytes);
+          for (uint32_t i = 0; i < args.rect_count; ++i) {
+            render_area::AddClearRect(area, rects[i].rect);
+          }
+          break;
+        }
+
+        default:
+          break;
+      }
+
+      pass_stream += header.arguments_size_elements;
+      pass_remaining -= header.arguments_size_elements;
+    }
+    return full;
+  };
+
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -55,7 +140,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         render_pass_begin_info.pNext = nullptr;
         render_pass_begin_info.renderPass = args.render_pass;
         render_pass_begin_info.framebuffer = args.framebuffer;
-        render_pass_begin_info.renderArea = args.render_area;
+        const VkRect2D render_area =
+            REXCVAR_GET(vulkan_tight_render_area)
+                ? pass_render_area(stream + header.arguments_size_elements,
+                                   stream_remaining - header.arguments_size_elements, args.render_area,
+                                   scissor, has_scissor)
+                : args.render_area;
+        render_pass_begin_info.renderArea = render_area;
         render_pass_begin_info.clearValueCount = args.clear_value_count;
         if (render_pass_begin_info.clearValueCount) {
           offset_bytes = rex::align(offset_bytes, alignof(VkClearValue));
@@ -131,6 +222,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkClearColorImage: {
         auto& args = *reinterpret_cast<const ArgsVkClearColorImage*>(stream);
+        if (gap_counts) {
+          ++gap_counts->clears;
+        }
         dfn.vkCmdClearColorImage(
             command_buffer, args.image, args.image_layout, &args.color, args.range_count,
             reinterpret_cast<const VkImageSubresourceRange*>(
@@ -140,6 +234,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkCopyBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
+        if (gap_counts) {
+          ++gap_counts->copies;
+        }
         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
                             reinterpret_cast<const VkBufferCopy*>(
                                 reinterpret_cast<const uint8_t*>(stream) +
@@ -148,12 +245,27 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkCopyBufferToImage: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBufferToImage*>(stream);
+        if (gap_counts) {
+          ++gap_counts->image_copies;
+        }
         dfn.vkCmdCopyBufferToImage(
             command_buffer, args.src_buffer, args.dst_image, args.dst_image_layout,
             args.region_count,
             reinterpret_cast<const VkBufferImageCopy*>(
                 reinterpret_cast<const uint8_t*>(stream) +
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+      } break;
+
+      case Command::kVkCopyImage: {
+        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
+        if (gap_counts) {
+          ++gap_counts->image_copies;
+        }
+        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
+                           args.dst_image_layout, args.region_count,
+                           reinterpret_cast<const VkImageCopy*>(
+                               reinterpret_cast<const uint8_t*>(stream) +
+                               rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
       } break;
 
       case Command::kVkCopyQueryPoolResults: {
@@ -165,6 +277,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkDispatch: {
         auto& args = *reinterpret_cast<const ArgsVkDispatch*>(stream);
+        if (gap_counts) {
+          ++gap_counts->dispatches;
+        }
         dfn.vkCmdDispatch(command_buffer, args.group_count_x, args.group_count_y,
                           args.group_count_z);
       } break;
@@ -215,7 +330,13 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         VkRenderingInfo rendering_info = {};
         rendering_info.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         rendering_info.flags = args.flags;
-        rendering_info.renderArea = args.render_area;
+        const VkRect2D render_area =
+            REXCVAR_GET(vulkan_tight_render_area)
+                ? pass_render_area(stream + header.arguments_size_elements,
+                                   stream_remaining - header.arguments_size_elements, args.render_area,
+                                   scissor, has_scissor)
+                : args.render_area;
+        rendering_info.renderArea = render_area;
         rendering_info.layerCount = args.layer_count;
         rendering_info.viewMask = args.view_mask;
         rendering_info.colorAttachmentCount = args.color_attachment_count;
@@ -231,6 +352,9 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkPipelineBarrier: {
         auto& args = *reinterpret_cast<const ArgsVkPipelineBarrier*>(stream);
+        if (gap_counts) {
+          ++gap_counts->barrier_batches;
+        }
         size_t barrier_offset_bytes = sizeof(ArgsVkPipelineBarrier);
         const VkMemoryBarrier* memory_barriers = nullptr;
         if (args.memory_barrier_count) {
@@ -268,6 +392,11 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkResetQueryPool: {
         auto& args = *reinterpret_cast<const ArgsVkResetQueryPool*>(stream);
+        if (args.query_count == kDeferredWriteTimestampQueryCount) {
+          deferred_write_timestamp(command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                   args.query_pool, args.first_query);
+          break;
+        }
         dfn.vkCmdResetQueryPool(command_buffer, args.query_pool, args.first_query,
                                 args.query_count);
       } break;
@@ -285,10 +414,14 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkSetScissor: {
         auto& args = *reinterpret_cast<const ArgsVkSetScissor*>(stream);
-        dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count,
-                            reinterpret_cast<const VkRect2D*>(
-                                reinterpret_cast<const uint8_t*>(stream) +
-                                rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D))));
+        const VkRect2D* rects = reinterpret_cast<const VkRect2D*>(
+            reinterpret_cast<const uint8_t*>(stream) +
+            rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+        dfn.vkCmdSetScissor(command_buffer, args.first_scissor, args.scissor_count, rects);
+        if (args.first_scissor == 0 && args.scissor_count >= 1) {
+          scissor = rects[0];
+          has_scissor = true;
+        }
       } break;
 
       case Command::kVkSetStencilCompareMask: {

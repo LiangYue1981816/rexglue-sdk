@@ -312,7 +312,14 @@ bool ReXApp::SetupPresentation() {
   OnPreSetup(config_);
 
   if (!config_.graphics && !config_.gpu_plugin.empty()) {
-    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin);
+    std::string gpu_backend = REXCVAR_QUERY(std::string, gpu_backend);
+    config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, gpu_backend);
+    if (!config_.graphics && gpu_backend != "any") {
+      REXLOG_ERROR(
+          "GPU backend '{}' requested via gpu_backend is not available; falling back to 'any'.",
+          gpu_backend);
+      config_.graphics = rex::system::LoadGpuPlugin(config_.gpu_plugin, "any");
+    }
     if (!config_.graphics) {
       // Fatal by design: no silent headless fallback.
       auto msg =

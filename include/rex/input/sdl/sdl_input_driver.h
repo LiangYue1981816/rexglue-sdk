@@ -62,6 +62,7 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
     SDL_Gamepad* sdl;
     X_INPUT_CAPABILITIES caps;
     X_INPUT_STATE state;
+    uint16_t physical_buttons = 0;  // XInput bits of the buttons physically held, before pad_map_* remapping.
     bool state_changed;
     bool is_active;
     DeviceId id;

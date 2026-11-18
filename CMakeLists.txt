@@ -115,14 +115,20 @@ function(rex_config_postfix target)
 endfunction()
 
 if(NOT WIN32)
-    # Use appropriate code model based on architecture
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64" AND NOT APPLE)
-        # Large code model on Linux x86_64 for linking with very large recompiled executables (35MB+).
-        # macOS uses small: the ld64 linker on macOS 15+ rejects text relocations produced
-        # by -mcmodel=large, and macOS maps binaries in the low address space so ±2GB is sufficient.
-        add_compile_options(-mcmodel=large)
-    else()
-        add_compile_options(-mcmodel=small)
+    # Small code model everywhere: it reaches ±2 GB, and a recompiled game's code is tens of MB.
+    # The large model made every call and global access on Linux x86_64 an absolute 64-bit
+    # address through a register.
+    add_compile_options(-mcmodel=small)
+    # Calls between a shared SDK library's own functions bind inside it instead of going through
+    # its PLT: with default visibility every one was interposable (librexruntime.so had thousands
+    # of such PLT targets on Linux and Android). Weak functions (inline, templates) stay
+    # interposable, so every module still shares one copy of them. lld only (Android, and Linux
+    # with -fuse-ld=lld); GNU ld has no non-weak variant.
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-Wl,-Bsymbolic-non-weak-functions" REX_LINKER_BSYMBOLIC_NON_WEAK)
+    if(REX_LINKER_BSYMBOLIC_NON_WEAK AND NOT APPLE)
+        add_link_options(
+            $<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,SHARED_LIBRARY>:-Wl,-Bsymbolic-non-weak-functions>)
     endif()
     # Position-independent code for all targets
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -159,7 +165,15 @@ if(WIN32)
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
 elseif(UNIX AND NOT APPLE)
-    if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+    if(ANDROID)
+        if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+            set(REX_PLATFORM "android-x64")
+        elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+            set(REX_PLATFORM "android-arm64")
+        else()
+            set(REX_PLATFORM "android-${REX_TARGET_PROCESSOR}")
+        endif()
+    elseif(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
         set(REX_PLATFORM "linux-arm64")
@@ -186,9 +200,12 @@ add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_pch.cmake)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/rex_version.cmake)
+# SOURCE_DIR: the SDK's own git history, also when a game adds the SDK with add_subdirectory
+# (CMAKE_SOURCE_DIR is then the game's repository).
 rex_resolve_version(REXGLUE_FULL_VERSION
     FLOOR_MAJOR ${PROJECT_VERSION_MAJOR}
-    FLOOR_MINOR ${PROJECT_VERSION_MINOR})
+    FLOOR_MINOR ${PROJECT_VERSION_MINOR}
+    SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 
 # Strip the -id trailer (if any) for the numeric-only version.
 string(REGEX REPLACE "-.*$" "" REXGLUE_NUMERIC_VERSION "${REXGLUE_FULL_VERSION}")

@@ -6,6 +6,7 @@
 #include <vector>
 
 #include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
 #include <rex/input/input_system.h>
 
 // The X_STATUS_* / X_ERROR_* macros cast through these unqualified, so
@@ -36,11 +37,30 @@ DeviceInfo Pad(uint64_t id, uint32_t ordinal) {
   return info;
 }
 
+DeviceInfo Synthetic(uint64_t id) {
+  DeviceInfo info;
+  info.id = static_cast<DeviceId>(id);
+  info.synthetic = true;
+  return info;
+}
+
 std::vector<DeviceId> For(const DeviceAssignment& a, uint32_t user) {
   std::vector<DeviceId> out;
   a.DevicesForUser(user, out);
   return out;
 }
+
+/// Sets input_pad_first_user for one test and restores the previous value.
+class FirstUserGuard {
+ public:
+  explicit FirstUserGuard(uint32_t value) : saved_(REXCVAR_GET(input_pad_first_user)) {
+    REXCVAR_GET(input_pad_first_user) = value;
+  }
+  ~FirstUserGuard() { REXCVAR_GET(input_pad_first_user) = saved_; }
+
+ private:
+  uint32_t saved_;
+};
 
 /// Exercises assignment with no SDL, window, or OS behind it.
 class FakeDriver final : public InputDriver {
@@ -235,4 +255,26 @@ TEST_CASE("A synthetic device does not push the first pad off guest user 0", "[i
   REQUIRE(system->GetState(0, &state) == X_ERROR_SUCCESS);
   REQUIRE(static_cast<uint16_t>(state.gamepad.buttons) == X_INPUT_GAMEPAD_B);
   REQUIRE(system->GetState(1, &state) == X_ERROR_DEVICE_NOT_CONNECTED);
+}
+
+TEST_CASE("input_pad_first_user moves pads past keyboard player 1", "[input]") {
+  FirstUserGuard guard(1);
+  SlotAssignment slots;
+  slots.OnDevicesChanged({Synthetic(1), Pad(10, 0), Pad(11, 1)});
+
+  REQUIRE(For(slots, 0) == std::vector<DeviceId>{static_cast<DeviceId>(1)});
+  REQUIRE(For(slots, 1) == std::vector<DeviceId>{static_cast<DeviceId>(10)});
+  REQUIRE(For(slots, 2) == std::vector<DeviceId>{static_cast<DeviceId>(11)});
+  REQUIRE(For(slots, 3).empty());
+}
+
+TEST_CASE("input_pad_first_user drops pads that land past the last guest user", "[input]") {
+  FirstUserGuard guard(3);
+  SlotAssignment slots;
+  slots.OnDevicesChanged({Pad(10, 0), Pad(11, 1)});
+
+  REQUIRE(For(slots, 0).empty());
+  REQUIRE(For(slots, 1).empty());
+  REQUIRE(For(slots, 2).empty());
+  REQUIRE(For(slots, 3) == std::vector<DeviceId>{static_cast<DeviceId>(10)});
 }

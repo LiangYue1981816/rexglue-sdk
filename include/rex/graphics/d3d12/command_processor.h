@@ -56,6 +56,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
+  void InitializeTextureReplacement(const std::filesystem::path& cache_root,
+                                    uint32_t title_id) override;
+
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
@@ -67,6 +70,14 @@ class D3D12CommandProcessor : public CommandProcessor {
     return deferred_command_list_;
   }
 
+  // Call after recording a DeferredCommandList::Callback that may have changed pipelines, root
+  // signatures or descriptor heaps: the next draw re-binds everything.
+  void InvalidateBindingsAfterExternalCommands() {
+    current_guest_pipeline_ = nullptr;
+    current_external_pipeline_ = nullptr;
+    current_graphics_root_signature_ = nullptr;
+    current_graphics_root_up_to_date_ = 0;
+  }
   uint64_t GetCurrentSubmission() const { return submission_current_; }
   uint64_t GetCompletedSubmission() const { return submission_completed_; }
 
@@ -144,6 +155,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     kEdramR32UintUAV,
     kEdramR32G32UintUAV,
     kEdramR32G32B32A32UintUAV,
+    // The second 2048 tiles of the virtual EDRAM, for resolves.
+    kEdramRawSRVSecondHalf,
+    kEdramR32UintSRVSecondHalf,
+    kEdramR32G32UintSRVSecondHalf,
+    kEdramR32G32B32A32UintSRVSecondHalf,
 
     kGammaRampTableSRV,
     kGammaRampPWLSRV,
@@ -165,7 +181,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSharedMemoryUintPow2BindlessUAVHandlePair(
       uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
+      uint32_t element_size_bytes_pow2, bool second_half = false) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetEdramUintPow2BindlessUAVHandlePair(
       uint32_t element_size_bytes_pow2) const;
 
@@ -181,6 +197,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // if failed to create the pipeline.
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return pipeline_cache_->GetD3D12PipelineByHandle(handle);
+  }
+
+  // Zero until the pipeline cache is created.
+  PipelineCache::ShaderStorageProgress GetShaderStorageProgress() const {
+    return pipeline_cache_ ? pipeline_cache_->GetShaderStorageProgress()
+                           : PipelineCache::ShaderStorageProgress{};
   }
 
   // Sets the current cached values to external ones. This is for cache

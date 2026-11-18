@@ -34,6 +34,10 @@
 #endif
 
 #if REX_PLATFORM_ANDROID
+#include <android/api-level.h>
+#include <android/native_window.h>
+#include <dlfcn.h>
+
 #include <rex/ui/surface_android.h>
 #endif
 #if REX_PLATFORM_GNU_LINUX
@@ -49,6 +53,24 @@
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
 
+#if REX_PLATFORM_ANDROID
+// FIFO lets the compositor pace the panel; implicit vsync paints on the UI, freeing the GPU thread.
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, false, "UI/Vulkan",
+                    "Allow immediate present mode (no vsync)");
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, false, "UI/Vulkan",
+                    "Allow mailbox present mode (triple buffering)");
+
+REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, false, "UI/Vulkan",
+                    "Allow FIFO relaxed present mode");
+
+REXCVAR_DEFINE_INT32(present_android_frame_rate, 30, "UI/Vulkan",
+                     "Frame rate in Hz the window asks Android for "
+                     "(ANativeWindow_setFrameRate, Android 11+), so the panel can run at a lower "
+                     "refresh rate than 120 Hz; 0 asks for nothing")
+    .range(0, 240)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_immediate, true, "UI/Vulkan",
                     "Allow immediate present mode (no vsync)");
 
@@ -57,10 +79,42 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
+#endif
 
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+#if REX_PLATFORM_ANDROID
+namespace {
+
+void RequestAndroidFrameRate(ANativeWindow* window) {
+  using SetFrameRate = int32_t (*)(ANativeWindow*, float, int8_t);
+  static const SetFrameRate set_frame_rate = [] {
+    void* library = dlopen("libnativewindow.so", RTLD_NOW | RTLD_LOCAL);
+    if (!library) {
+      library = dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+    }
+    auto function = library ? reinterpret_cast<SetFrameRate>(
+                                  dlsym(library, "ANativeWindow_setFrameRate"))
+                            : nullptr;
+    if (!function) {
+      REXLOG_INFO("VulkanPresenter: ANativeWindow_setFrameRate is not available (API level {})",
+                  android_get_device_api_level());
+    }
+    return function;
+  }();
+  if (!set_frame_rate) {
+    return;
+  }
+  int32_t rate = REXCVAR_GET(present_android_frame_rate);
+  int32_t result =
+      set_frame_rate(window, float(rate), 0 /* ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_DEFAULT */);
+  REXLOG_INFO("VulkanPresenter: ANativeWindow_setFrameRate({} Hz) returned {}", rate, result);
+}
+
+}  // namespace
+#endif
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
 namespace {
@@ -109,6 +163,9 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_bilinear_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_bilinear_ps.h"
+#if REX_PLATFORM_ANDROID
+#include "../shaders/vulkan_spirv/guest_output_sgsr1_ps.h"
+#endif
 #if defined(REX_HAS_FIDELITYFX_SDK)
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
@@ -129,9 +186,6 @@ VulkanPresenter::PaintContext::Submission::~Submission() {
     dfn.vkDestroyCommandPool(device, draw_command_pool_, nullptr);
   }
 
-  if (present_semaphore_ != VK_NULL_HANDLE) {
-    dfn.vkDestroySemaphore(device, present_semaphore_, nullptr);
-  }
   if (acquire_semaphore_ != VK_NULL_HANDLE) {
     dfn.vkDestroySemaphore(device, acquire_semaphore_, nullptr);
   }
@@ -149,13 +203,6 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
       VK_SUCCESS) {
     REXLOG_ERROR(
         "VulkanPresenter: Failed to create a swapchain image acquisition "
-        "semaphore");
-    return false;
-  }
-  if (dfn.vkCreateSemaphore(device, &semaphore_create_info, nullptr, &present_semaphore_) !=
-      VK_SUCCESS) {
-    REXLOG_ERROR(
-        "VulkanPresenter: Failed to create a swapchain image presentation "
         "semaphore");
     return false;
   }
@@ -771,9 +818,7 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
         paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
     // Destroy the old swapchain that may be retired now.
-    if (old_swapchain != VK_NULL_HANDLE) {
-      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
-    }
+    paint_context_.DestroyRetiredSwapchain(old_swapchain);
     if (paint_context_.swapchain == VK_NULL_HANDLE) {
       // Couldn't create the swapchain for the existing surface - start over.
       paint_context_.DestroySwapchainAndVulkanSurface();
@@ -884,6 +929,12 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
     }
     // Successfully attached (at least for now).
   }
+
+#if REX_PLATFORM_ANDROID
+  if (new_surface.GetType() == Surface::kTypeIndex_AndroidNativeWindow) {
+    RequestAndroidFrameRate(static_cast<const AndroidNativeWindowSurface&>(new_surface).window());
+  }
+#endif
 
   // From now on, in case of failure,
   // paint_context_.DestroySwapchainAndVulkanSurface must be called before
@@ -1034,6 +1085,23 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       return SurfacePaintConnectResult::kFailure;
     }
     paint_context_.swapchain_framebuffers.emplace_back(image_view, framebuffer);
+  }
+
+  assert_true(paint_context_.swapchain_present_semaphores.empty());
+  paint_context_.swapchain_present_semaphores.reserve(paint_context_.swapchain_images.size());
+  VkSemaphoreCreateInfo present_semaphore_create_info;
+  present_semaphore_create_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+  present_semaphore_create_info.pNext = nullptr;
+  present_semaphore_create_info.flags = 0;
+  for (size_t i = 0; i < paint_context_.swapchain_images.size(); ++i) {
+    VkSemaphore present_semaphore;
+    if (dfn.vkCreateSemaphore(device, &present_semaphore_create_info, nullptr,
+                              &present_semaphore) != VK_SUCCESS) {
+      REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain image present semaphore");
+      paint_context_.DestroySwapchainAndVulkanSurface();
+      return SurfacePaintConnectResult::kFailure;
+    }
+    paint_context_.swapchain_present_semaphores.push_back(present_semaphore);
   }
 
   is_vsync_implicit_out = paint_context_.swapchain_is_fifo;
@@ -1436,6 +1504,11 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
     dfn.vkDestroyImageView(device, framebuffer.image_view, nullptr);
   }
   swapchain_framebuffers.clear();
+  // A present of the retired swapchain may still wait on these: destroyed with the swapchain.
+  retired_present_semaphores.insert(retired_present_semaphores.end(),
+                                    swapchain_present_semaphores.begin(),
+                                    swapchain_present_semaphores.end());
+  swapchain_present_semaphores.clear();
   swapchain_images.clear();
   swapchain_extent.width = 0;
   swapchain_extent.height = 0;
@@ -1445,12 +1518,20 @@ VkSwapchainKHR VulkanPresenter::PaintContext::PrepareForSwapchainRetirement() {
   return old_swapchain;
 }
 
-void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
-  VkSwapchainKHR old_swapchain = PrepareForSwapchainRetirement();
+void VulkanPresenter::PaintContext::DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain) {
+  const VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
   if (old_swapchain != VK_NULL_HANDLE) {
-    vulkan_device->functions().vkDestroySwapchainKHR(vulkan_device->device(), old_swapchain,
-                                                     nullptr);
+    dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
   }
+  for (VkSemaphore semaphore : retired_present_semaphores) {
+    dfn.vkDestroySemaphore(device, semaphore, nullptr);
+  }
+  retired_present_semaphores.clear();
+}
+
+void VulkanPresenter::PaintContext::DestroySwapchainAndVulkanSurface() {
+  DestroyRetiredSwapchain(PrepareForSwapchainRetirement());
   present_queue_family = UINT32_MAX;
   if (vulkan_surface != VK_NULL_HANDLE) {
     const VulkanInstance* vulkan_instance = vulkan_device->vulkan_instance();
@@ -1652,6 +1733,27 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
         guest_output_properties, paint_context_.swapchain_extent.width,
         paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
         max_framebuffer_extent.height, guest_output_paint_config);
+#if REX_PLATFORM_ANDROID
+    if (guest_output_flow.effect_count &&
+        !PrepareGuestOutputPaintFlowPipelines(guest_output_flow)) {
+      if (!guest_output_paint_fallback_logged_) {
+        guest_output_paint_fallback_logged_ = true;
+        REXLOG_WARN(
+            "VulkanPresenter: the configured present effect is unavailable on this GPU; drawing "
+            "the guest output with bilinear filtering");
+      }
+      GuestOutputPaintConfig bilinear_config = guest_output_paint_config;
+      bilinear_config.SetEffect(GuestOutputPaintConfig::Effect::kBilinear);
+      guest_output_flow = GetGuestOutputPaintFlow(
+          guest_output_properties, paint_context_.swapchain_extent.width,
+          paint_context_.swapchain_extent.height, max_framebuffer_extent.width,
+          max_framebuffer_extent.height, bilinear_config);
+      if (guest_output_flow.effect_count &&
+          !PrepareGuestOutputPaintFlowPipelines(guest_output_flow)) {
+        guest_output_flow.effect_count = 0;
+      }
+    }
+#endif
     if (guest_output_flow.effect_count) {
       // Store the main target reference to the guest output image so it's not
       // destroyed while it's still potentially in use by main target painting
@@ -1840,6 +1942,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
+            } else {
+              // Without this the format check above recreated the pipeline on every paint.
+              swapchain_effect_pipeline.swapchain_format =
+                  paint_context_.swapchain_render_pass_format;
             }
           }
         }
@@ -2027,6 +2133,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           uint32_t effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
+#if REX_PLATFORM_ANDROID
+            Sgsr1Constants sgsr1;
+#endif
 #if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
@@ -2035,6 +2144,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 #endif
           } effect_constants;
           switch (guest_output_paint_pipeline_layout_index) {
+#if REX_PLATFORM_ANDROID
+            case kGuestOutputPaintPipelineLayoutIndexSgsr1: {
+              effect_constants_size = sizeof(effect_constants.sgsr1);
+              effect_constants.sgsr1.Initialize(guest_output_flow, i);
+            } break;
+#endif
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
@@ -2174,7 +2289,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     paint_context_.ui_setup_command_buffer_current_index = SIZE_MAX;
   }
   command_buffers[command_buffer_count++] = draw_command_buffer;
-  VkSemaphore present_semaphore = paint_submission.present_semaphore();
+  VkSemaphore present_semaphore =
+      paint_context_.swapchain_present_semaphores[swapchain_image_index];
   VkSubmitInfo submit_info;
   submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
   submit_info.pNext = nullptr;
@@ -2331,6 +2447,11 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       guest_output_paint_push_constant_ranges;
   for (size_t i = 0; i < size_t(kGuestOutputPaintPipelineLayoutCount); ++i) {
     switch (GuestOutputPaintPipelineLayoutIndex(i)) {
+#if REX_PLATFORM_ANDROID
+      case kGuestOutputPaintPipelineLayoutIndexSgsr1:
+        guest_output_paint_push_constant_range_ffx.size = sizeof(Sgsr1Constants);
+        break;
+#endif
       case kGuestOutputPaintPipelineLayoutIndexBilinear:
         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
         break;
@@ -2378,9 +2499,25 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         "vertex shader module");
     return false;
   }
+#if REX_PLATFORM_ANDROID
+  const GuestOutputPaintConfig::Effect configured_effect = GetConfiguredGuestOutputPaintEffect();
+#endif
   for (size_t i = 0; i < size_t(GuestOutputPaintEffect::kCount); ++i) {
     GuestOutputPaintEffect guest_output_paint_effect = GuestOutputPaintEffect(i);
+#if REX_PLATFORM_ANDROID
+    // Effects present_effect cannot reach are never compiled, so a driver that rejects one of them
+    // cannot take the presenter down.
+    if (!IsGuestOutputPaintEffectUsedBy(configured_effect, guest_output_paint_effect)) {
+      continue;
+    }
+#endif
     switch (guest_output_paint_effect) {
+#if REX_PLATFORM_ANDROID
+      case GuestOutputPaintEffect::kSgsr1:
+        shader_module_create_info.codeSize = sizeof(shaders::guest_output_sgsr1_ps);
+        shader_module_create_info.pCode = shaders::guest_output_sgsr1_ps;
+        break;
+#endif
       case GuestOutputPaintEffect::kBilinear:
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_ps);
         shader_module_create_info.pCode = shaders::guest_output_bilinear_ps;
@@ -2427,6 +2564,14 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     }
     if (dfn.vkCreateShaderModule(device, &shader_module_create_info, nullptr,
                                  &guest_output_paint_fs_[i]) != VK_SUCCESS) {
+#if REX_PLATFORM_ANDROID
+      if (guest_output_paint_effect != GuestOutputPaintEffect::kBilinear &&
+          guest_output_paint_effect != GuestOutputPaintEffect::kBilinearDither) {
+        guest_output_paint_fs_[i] = VK_NULL_HANDLE;
+        MarkGuestOutputPaintEffectUnavailable(guest_output_paint_effect, "shader module");
+        continue;
+      }
+#endif
       REXLOG_ERROR(
           "VulkanPresenter: Failed to create the guest output painting shader "
           "module for effect {}",
@@ -2508,7 +2653,12 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
     VkPipeline guest_output_paint_intermediate_pipeline = CreateGuestOutputPaintPipeline(
         GuestOutputPaintEffect(i), guest_output_intermediate_render_pass_);
     if (guest_output_paint_intermediate_pipeline == VK_NULL_HANDLE) {
+#if REX_PLATFORM_ANDROID
+      MarkGuestOutputPaintEffectUnavailable(GuestOutputPaintEffect(i), "intermediate pipeline");
+      continue;
+#else
       return false;
+#endif
     }
     paint_context_.guest_output_paint_pipelines[i].intermediate_pipeline =
         guest_output_paint_intermediate_pipeline;
@@ -2569,6 +2719,71 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
 
   return InitializeCommonSurfaceIndependent();
 }
+
+#if REX_PLATFORM_ANDROID
+void VulkanPresenter::MarkGuestOutputPaintEffectUnavailable(GuestOutputPaintEffect effect,
+                                                            const char* what) {
+  size_t index = size_t(effect);
+  if (guest_output_paint_effect_unavailable_[index]) {
+    return;
+  }
+  guest_output_paint_effect_unavailable_[index] = true;
+  REXLOG_WARN("VulkanPresenter: Failed to create the {} of present effect {}; the effect is "
+              "unavailable",
+              what, index);
+}
+
+bool VulkanPresenter::PrepareGuestOutputPaintFlowPipelines(const GuestOutputPaintFlow& flow) {
+  // The effect tables the fallback relies on.
+  using Selected = GuestOutputPaintConfig::Effect;
+  using Pass = GuestOutputPaintEffect;
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kBilinear, Pass::kBilinear));
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kSgsr1, Pass::kBilinearDither));
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kSgsr1, Pass::kSgsr1));
+  static_assert(!IsGuestOutputPaintEffectUsedBy(Selected::kBilinear, Pass::kSgsr1));
+#if defined(REX_HAS_FIDELITYFX_SDK)
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kFsr, Pass::kFsrEasu));
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kFsr, Pass::kCasSharpen));
+  static_assert(IsGuestOutputPaintEffectUsedBy(Selected::kCas, Pass::kCasResampleDither));
+  static_assert(!IsGuestOutputPaintEffectUsedBy(Selected::kCas, Pass::kFsrEasu));
+  static_assert(!IsGuestOutputPaintEffectUsedBy(Selected::kSgsr1, Pass::kFsrRcas));
+  static_assert(!IsGuestOutputPaintEffectUsedBy(Selected::kBilinear, Pass::kCasSharpen));
+#endif
+  static_assert(!CanGuestOutputPaintEffectBeIntermediate(Pass::kSgsr1));
+  for (size_t i = 0; i < flow.effect_count; ++i) {
+    size_t effect_index = size_t(flow.effects[i]);
+    if (guest_output_paint_effect_unavailable_[effect_index] ||
+        guest_output_paint_fs_[effect_index] == VK_NULL_HANDLE) {
+      return false;
+    }
+    if (i + 1 < flow.effect_count &&
+        paint_context_.guest_output_paint_pipelines[effect_index].intermediate_pipeline ==
+            VK_NULL_HANDLE) {
+      return false;
+    }
+  }
+  GuestOutputPaintEffect final_effect = flow.effects[flow.effect_count - 1];
+  PaintContext::GuestOutputPaintPipeline& final_pipeline =
+      paint_context_.guest_output_paint_pipelines[size_t(final_effect)];
+  if (final_pipeline.swapchain_pipeline != VK_NULL_HANDLE &&
+      final_pipeline.swapchain_format != paint_context_.swapchain_render_pass_format) {
+    paint_context_.submission_tracker.AwaitSubmissionCompletion(
+        paint_context_.guest_output_image_paint_last_submission);
+    util::DestroyAndNullHandle(vulkan_device_->functions().vkDestroyPipeline,
+                               vulkan_device_->device(), final_pipeline.swapchain_pipeline);
+  }
+  if (final_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+    final_pipeline.swapchain_pipeline =
+        CreateGuestOutputPaintPipeline(final_effect, paint_context_.swapchain_render_pass);
+    if (final_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+      MarkGuestOutputPaintEffectUnavailable(final_effect, "swapchain pipeline");
+      return false;
+    }
+    final_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
+  }
+  return true;
+}
+#endif
 
 VkPipeline VulkanPresenter::CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
                                                            VkRenderPass render_pass) {

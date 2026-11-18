@@ -56,10 +56,14 @@ std::unordered_map<std::string, size_t>& GetRegistryIndex() {
 }
 
 // Values that arrived before their cvar was registered; runtime-loaded
-// modules register cvars long after Init/LoadConfig.
+// modules register cvars long after Init/LoadConfig. A runtime value set
+// before registration (an app choosing a default for a GPU plugin's cvar
+// before the plugin loads) becomes the default: the config, environment and
+// command line still override it.
 struct PendingValues {
   std::optional<std::string> cmdline;
   std::optional<std::string> config;
+  std::optional<std::string> runtime;
 };
 
 std::unordered_map<std::string, PendingValues>& GetPendingValuesStorage() {
@@ -241,6 +245,9 @@ std::optional<size_t> RegisterFlag(FlagEntry entry) {
     FlagEntry& stored = storage[pos];
     auto& pending = GetPendingValuesStorage();
     auto pending_it = pending.find(stored.name);
+    if (pending_it != pending.end() && pending_it->second.runtime) {
+      ApplyFromSource(stored, *pending_it->second.runtime, Source::kDefault);
+    }
     if (pending_it != pending.end() && pending_it->second.config) {
       ApplyFromSource(stored, *pending_it->second.config, Source::kConfig);
     }
@@ -299,6 +306,11 @@ ApplyResult SetFlagFromSource(std::string_view name, std::string_view value, Sou
   std::lock_guard lock(GetRegistryMutex());
   auto it = GetRegistryIndex().find(std::string(name));
   if (it == GetRegistryIndex().end()) {
+    if (source == Source::kRuntime && g_init_done) {
+      GetPendingValuesStorage()[std::string(name)].runtime = std::string(value);
+      REXLOG_DEBUG("cvar: '{}' deferred until its module registers it", name);
+      return ApplyResult::kApplied;
+    }
     return ApplyResult::kRejected;
   }
 
@@ -384,6 +396,18 @@ Source GetFlagSource(std::string_view name) {
   std::lock_guard lock(GetRegistryMutex());
   auto it = GetRegistryIndex().find(std::string(name));
   if (it == GetRegistryIndex().end()) {
+    // Not registered yet: report where the value it will get at registration comes from.
+    auto& pending = GetPendingValuesStorage();
+    auto pending_it = pending.find(std::string(name));
+    if (pending_it != pending.end() && pending_it->second.cmdline) {
+      return Source::kCommandLine;
+    }
+    if (rex::platform::env::get(FlagNameToEnvVar(name)).has_value()) {
+      return Source::kEnvironment;
+    }
+    if (pending_it != pending.end() && pending_it->second.config) {
+      return Source::kConfig;
+    }
     return Source::kDefault;
   }
   return GetRegistryStorage()[it->second].source;

@@ -11,6 +11,7 @@
  */
 
 #include <array>
+#include <deque>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -21,6 +22,7 @@
 #include <rex/graphics/vulkan/shared_memory.h>
 #include <rex/hash.h>
 #include <rex/ui/vulkan/mem_alloc.h>
+#include <rex/ui/vulkan/single_layout_descriptor_set_pool.h>
 
 namespace rex::graphics::vulkan {
 
@@ -88,6 +90,15 @@ class VulkanTextureCache final : public TextureCache {
 
   VkImageView GetActiveBindingOrNullImageView(uint32_t fetch_constant_index,
                                               xenos::FetchOpDimension dimension, bool is_signed);
+  // Changes whenever an image view or a sampler is destroyed: a descriptor written before then may
+  // name a handle that a new object now reuses.
+  uint64_t destroyed_binding_count() const { return destroyed_binding_count_; }
+#if REX_PLATFORM_ANDROID
+  // Valid fetch constants bound without an image view (they read 0) since the last call.
+  uint32_t TakeAndroidMissingTextureBindings() {
+    return std::exchange(android_missing_texture_bindings_, 0);
+  }
+#endif
 
   SamplerParameters GetSamplerParameters(const VulkanShader::SamplerBinding& binding) const;
 
@@ -132,6 +143,87 @@ class VulkanTextureCache final : public TextureCache {
   void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
+
+  // gpu_native_resolves: how the source is written into the textures.
+  enum class NativeResolveMode : uint32_t {
+    // The values of the native_resolve.cs.glsl modes.
+    // out = in * scale.
+    kScale,
+    // out = in.bgra.
+    kSwapRedBlue,
+    // out.r = depth.
+    kDepthToRed,
+    // vkCmdCopyImage.
+    kCopy,
+  };
+  // gpu_native_resolves: a resolve rectangle to copy from a host render target straight into the
+  // textures viewing the resolve destination. Coordinates and sizes are in guest pixels, unscaled.
+  struct NativeResolveWrite {
+    // Physical 4 KB page of the texture base the destination coordinates are relative to.
+    uint32_t base_page;
+    xenos::TextureFormat format;
+    // In TextureKey::pitch units (32 texels).
+    uint32_t pitch;
+    xenos::Endian endianness;
+    // Mip 0, layer 0 is read. With kCopy, source_format must be the VkFormat of the textures, and
+    // the image must have been created with VK_IMAGE_USAGE_TRANSFER_SRC_BIT.
+    VkImage source = VK_NULL_HANDLE;
+    VkFormat source_format = VK_FORMAT_UNDEFINED;
+    // All the aspects of the source, for the barriers.
+    VkImageAspectFlags source_aspects = VK_IMAGE_ASPECT_COLOR_BIT;
+    // Shader modes: a 2D float view of the source (the depth aspect for depth).
+    VkImageView source_view = VK_NULL_HANDLE;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t dest_x;
+    uint32_t dest_y;
+    uint32_t width;
+    uint32_t height;
+    NativeResolveMode mode = NativeResolveMode::kCopy;
+    // kScale multiplier.
+    float scale = 1.0f;
+    // Shader modes: resolution-scaled host pixel columns / rows at the left / top of the rectangle
+    // taken from the first column / row after them - the half-pixel offset gap fill of the resolve
+    // shaders (ResolveEdramInfo::fill_half_pixel_offset).
+    uint32_t fill_x = 0;
+    uint32_t fill_y = 0;
+  };
+  // gpu_native_resolves: the current usage of the source, updated if it's transitioned.
+  struct NativeResolveSourceUsage {
+    VkPipelineStageFlags stage_mask;
+    VkAccessFlags access_mask;
+    VkImageLayout layout;
+  };
+  struct NativeResolveWriteCounts {
+    uint32_t written = 0;
+    uint32_t incompatible = 0;
+    uint32_t not_up_to_date = 0;
+    // No image (there are no replacement textures in the Vulkan texture cache).
+    uint32_t replacement = 0;
+    uint32_t outside = 0;
+    // Shader modes: the texture was created without VK_IMAGE_USAGE_STORAGE_BIT while the device
+    // supports storage images of its format.
+    uint32_t no_uav = 0;
+    // Shader modes: the device doesn't support storage images of the texture format.
+    uint32_t no_storage_format = 0;
+    // Shader modes: native_resolve pipeline for the texture format not created.
+    uint32_t no_pipeline = 0;
+    // Shader modes: failed to get the descriptor set.
+    uint32_t descriptors = 0;
+    // Shader modes: failed to create the storage view of the texture.
+    uint32_t image_view = 0;
+    // kCopy: the VkFormat of the texture is not the one of the source.
+    uint32_t copy_format = 0;
+  };
+  // Writes the rectangle into every texture at write.base_page that is a single-level unsigned 2D
+  // tiled texture with the format, pitch and endianness of the resolve, matching resolution
+  // scaling, and up to date before the resolve (CaptureUpToDateBeforeResolve), then marks those
+  // up to date. Leaves the written textures in the transfer destination or the native resolve
+  // storage usage, transitioned to the next usage like after loading.
+  // kCopy uses vkCmdCopyImage, the other modes native_resolve_*_cs.
+  void WriteNativeResolveToTextures(const NativeResolveWrite& write,
+                                    NativeResolveSourceUsage& source_usage,
+                                    NativeResolveWriteCounts& counts);
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -193,6 +285,8 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
+      // gpu_native_resolves: written by native_resolve_*_cs.
+      kNativeResolveStorage,
     };
 
     // Takes ownership of the image and its memory.
@@ -211,6 +305,15 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+
+    // gpu_native_resolves: whether the image was created with VK_IMAGE_USAGE_STORAGE_BIT.
+    bool native_resolve_storage() const { return native_resolve_storage_; }
+    void SetNativeResolveStorage(bool native_resolve_storage) {
+      native_resolve_storage_ = native_resolve_storage;
+    }
+    // gpu_native_resolves: the 2D storage view of mip 0, layer 0 with the format, created on the
+    // first use, VK_NULL_HANDLE in case of failure.
+    VkImageView GetOrCreateNativeResolveStorageView(VkFormat format);
 
    private:
     union ViewKey {
@@ -269,6 +372,9 @@ class VulkanTextureCache final : public TextureCache {
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
+
+    bool native_resolve_storage_ = false;
+    VkImageView native_resolve_storage_view_ = VK_NULL_HANDLE;
   };
 
   struct VulkanTextureBinding {
@@ -350,6 +456,40 @@ class VulkanTextureCache final : public TextureCache {
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_{};
   std::array<VkPipeline, kLoadShaderCount> load_pipelines_scaled_{};
 
+  // gpu_native_resolves: whether a texture of the guest format written by native_resolve_*_cs can
+  // be created with VK_IMAGE_USAGE_STORAGE_BIT on the device.
+  static bool IsNativeResolveStorageFormat(xenos::TextureFormat format) {
+    return format == xenos::TextureFormat::k_16_16_FLOAT ||
+           format == xenos::TextureFormat::k_16_16_16_16_FLOAT ||
+           format == xenos::TextureFormat::k_8_8_8_8 || format == xenos::TextureFormat::k_24_8 ||
+           format == xenos::TextureFormat::k_24_8_FLOAT;
+  }
+  std::array<bool, 64> native_resolve_storage_supported_{};
+  // gpu_native_resolves: native_resolve_*_cs, created only with the cvar enabled.
+  // Set 0 - binding 0 is the source sampled image, binding 1 is the destination storage image,
+  // NativeResolveConstants passed via push constants.
+  struct NativeResolveConstants {
+    uint32_t mode;
+    float scale;
+    int32_t source_offset[2];
+    int32_t dest_offset[2];
+    uint32_t size[2];
+    uint32_t fill[2];
+  };
+  enum NativeResolvePipelineIndex : uint32_t {
+    kNativeResolvePipelineIndexRGBA16F,
+    kNativeResolvePipelineIndexRGBA8,
+    kNativeResolvePipelineIndexR32F,
+    kNativeResolvePipelineIndexRG16F,
+    kNativeResolvePipelineCount,
+  };
+  VkDescriptorSetLayout native_resolve_descriptor_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout native_resolve_pipeline_layout_ = VK_NULL_HANDLE;
+  std::array<VkPipeline, kNativeResolvePipelineCount> native_resolve_pipelines_{};
+  std::unique_ptr<ui::vulkan::SingleLayoutDescriptorSetPool> native_resolve_descriptor_set_pool_;
+  // Descriptor set pool indices with the submission they were last used in.
+  std::deque<std::pair<uint64_t, size_t>> native_resolve_descriptor_sets_used_;
+
   // If both images can be placed in the same allocation, it's one allocation,
   // otherwise it's two separate.
   std::array<VkDeviceMemory, 2> null_images_memory_{};
@@ -359,6 +499,18 @@ class VulkanTextureCache final : public TextureCache {
   VkImageView null_image_view_cube_ = VK_NULL_HANDLE;
   VkImageView null_image_view_3d_ = VK_NULL_HANDLE;
   bool null_images_cleared_ = false;
+#if REX_PLATFORM_ANDROID
+  static bool IsAndroidBindingVariantUsed(const TextureBinding& binding,
+                                          xenos::FetchOpDimension dimension, bool is_signed) {
+    if (!AreDimensionsCompatible(dimension, binding.key.dimension)) {
+      return false;
+    }
+    return is_signed ? texture_util::IsAnySignSigned(binding.swizzled_signs)
+                     : texture_util::IsAnySignNotSigned(binding.swizzled_signs);
+  }
+
+  uint32_t android_missing_texture_bindings_ = 0;
+#endif
 
   std::array<VulkanTextureBinding, xenos::kTextureFetchConstantCount> vulkan_texture_bindings_;
 
@@ -379,6 +531,7 @@ class VulkanTextureCache final : public TextureCache {
   std::pair<const SamplerParameters, Sampler>* sampler_used_first_ = nullptr;
   std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
   uint32_t custom_border_color_sampler_count_ = 0;
+  mutable uint64_t destroyed_binding_count_ = 0;
 
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
   uint64_t scaled_resolve_buffer_size_ = 0;

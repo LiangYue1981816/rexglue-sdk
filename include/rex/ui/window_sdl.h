@@ -20,6 +20,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <rex/platform.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context_sdl.h>
 
@@ -43,6 +44,9 @@ class WindowSDL final : public Window {
   void HandleMouseEvent(SDL_Event& event);
   void HandleDropEvent(SDL_Event& event);
   void HandlePaintEvent();
+#if REX_PLATFORM_ANDROID
+  void HandleTouchEvent(SDL_Event& event);
+#endif
 
  protected:
   uint32_t GetLatestDpiImpl() const override;

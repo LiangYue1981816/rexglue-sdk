@@ -125,7 +125,118 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
 //     "GPU");
 
+#if REX_PLATFORM_ANDROID
+#include <mutex>
+#include <unordered_set>
+#endif
+
 namespace rex::graphics {
+
+#if REX_PLATFORM_ANDROID
+namespace {
+
+struct AndroidTextureLogInfo {
+  xenos::TextureFormat format;
+  const char* dimension_name;
+  uint32_t dimension;
+  uint32_t width;
+  uint32_t height;
+  bool signed_separate;
+  bool scaled_resolve;
+};
+
+uint32_t AndroidTextureFailureKey(const AndroidTextureLogInfo& info) {
+  return uint32_t(info.format) | (info.dimension << 6) | (uint32_t(info.scaled_resolve) << 8) |
+         (uint32_t(info.signed_separate) << 9);
+}
+
+bool IsFirstAndroidTextureFailure(uint32_t failure_key) {
+  static std::mutex mutex;
+  static std::unordered_set<uint32_t> seen;
+  std::lock_guard<std::mutex> lock(mutex);
+  return seen.insert(failure_key).second;
+}
+
+// A failed load leaves the host texture's contents undefined without any other log line.
+void LogAndroidTextureLoadFailureOnce(const AndroidTextureLogInfo& info) {
+  if (!IsFirstAndroidTextureFailure(AndroidTextureFailureKey(info))) {
+    return;
+  }
+  const FormatInfo* format_info = FormatInfo::Get(info.format);
+  REXGPU_WARN(
+      "TEXFAIL {} (guest format {}) {} {}x{} signed_separate {} scaled_resolve {}: the texture "
+      "data could not be loaded (logged once per format)",
+      format_info ? format_info->name : "?", uint32_t(info.format), info.dimension_name,
+      info.width, info.height, uint32_t(info.signed_separate), uint32_t(info.scaled_resolve));
+}
+
+constexpr uint32_t kAndroidZeroTextureLogLimit = 64;
+constexpr uint32_t kAndroidReloadedTextureLogLimit = 32;
+
+bool IsBlockCompressedGuestFormat(xenos::TextureFormat format) {
+  const FormatInfo* format_info = FormatInfo::Get(format);
+  return format_info && format_info->block_width == 4 && format_info->block_height == 4;
+}
+
+bool AreBytesZero(const uint8_t* data, uint32_t length) {
+  uint32_t offset = 0;
+  for (; offset + sizeof(uint64_t) <= length; offset += sizeof(uint64_t)) {
+    uint64_t word;
+    std::memcpy(&word, data + offset, sizeof(word));
+    if (word) {
+      return false;
+    }
+  }
+  for (; offset < length; ++offset) {
+    if (data[offset]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Only the GPU command thread loads textures.
+bool TakeAndroidLogSlot(uint32_t& logged, uint32_t limit) {
+  if (logged >= limit) {
+    return false;
+  }
+  ++logged;
+  return true;
+}
+
+struct AndroidTextureDescription {
+  xenos::TextureFormat format;
+  const char* dimension_name;
+  uint32_t width;
+  uint32_t height;
+  uint32_t depth;
+  uint32_t mip_levels;
+};
+
+struct AndroidTextureRanges {
+  uint32_t base_address;
+  uint32_t base_size;
+  bool base_zero;
+  uint32_t mips_address;
+  uint32_t mips_size;
+  bool mips_zero;
+};
+
+void LogAndroidTextureRanges(const char* tag, const char* what,
+                             const AndroidTextureDescription& texture,
+                             const AndroidTextureRanges& ranges) {
+  const FormatInfo* format_info = FormatInfo::Get(texture.format);
+  REXGPU_INFO(
+      "{} {} (guest format {}) {} {}x{}x{} mips {} base 0x{:08X} ({} bytes, zero {}) mips "
+      "0x{:08X} ({} bytes, zero {}): {}",
+      tag, format_info ? format_info->name : "?", uint32_t(texture.format),
+      texture.dimension_name, texture.width, texture.height, texture.depth, texture.mip_levels,
+      ranges.base_address, ranges.base_size, uint32_t(ranges.base_zero), ranges.mips_address,
+      ranges.mips_size, uint32_t(ranges.mips_zero), what);
+}
+
+}  // namespace
+#endif
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -296,6 +407,13 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     assert_true(found_texture_it != textures_.end());
     if (found_texture_it != textures_.end()) {
       assert_true(found_texture_it->second.get() == texture);
+      auto by_base_page_range = textures_by_base_page_.equal_range(texture->key().base_page);
+      for (auto it = by_base_page_range.first; it != by_base_page_range.second; ++it) {
+        if (it->second == texture) {
+          textures_by_base_page_.erase(it);
+          break;
+        }
+      }
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
     }
@@ -347,6 +465,32 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   // Invalidate textures. Toggling individual textures between scaled and
   // unscaled also relies on invalidation through shared memory.
   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
+}
+
+void TextureCache::CaptureUpToDateBeforeResolve(uint32_t start, uint32_t length) {
+  if (length == 0) {
+    return;
+  }
+  start &= 0x1FFFFFFF;
+  length = std::min(length, 0x20000000 - start);
+  uint32_t page_first = start >> 12;
+  uint32_t page_last = (start + length - 1) >> 12;
+  auto global_lock = global_critical_region_.Acquire();
+  if (textures_by_base_page_.size() < size_t(page_last - page_first + 1)) {
+    // Fewer textures than pages - cheaper to check every texture.
+    for (auto& pair : textures_by_base_page_) {
+      if (pair.first >= page_first && pair.first <= page_last) {
+        pair.second->CaptureBaseUpToDateBeforeResolve(global_lock);
+      }
+    }
+    return;
+  }
+  for (uint32_t page = page_first; page <= page_last; ++page) {
+    auto range = textures_by_base_page_.equal_range(page);
+    for (auto it = range.first; it != range.second; ++it) {
+      it->second->CaptureBaseUpToDateBeforeResolve(global_lock);
+    }
+  }
 }
 
 uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
@@ -437,8 +581,18 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
+#if REX_PLATFORM_ANDROID
+    LogAndroidTextureLoadFailureOnce(
+        {texture_key.format, texture_key.GetLogDimensionName(), uint32_t(texture_key.dimension),
+         texture_key.GetWidth(), texture_key.GetHeight(), bool(texture_key.signed_separate),
+         bool(texture_key.scaled_resolve)});
+#endif
     return false;
   }
+
+#if REX_PLATFORM_ANDROID
+  RecordAndroidTextureLoad(texture, pending_load.load_base, pending_load.load_mips);
+#endif
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
   // resolves as well to detect when the CPU wants to reuse the memory for a
@@ -449,6 +603,91 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   return true;
 }
+
+#if REX_PLATFORM_ANDROID
+namespace {
+
+void CountAndroidZeroLoad(TextureCache::AndroidTextureLoadStats& stats,
+                          const AndroidTextureDescription& texture,
+                          const AndroidTextureRanges& ranges) {
+  static uint32_t logged = 0;
+  if (!IsBlockCompressedGuestFormat(texture.format)) {
+    ++stats.zero_other;
+    return;
+  }
+  stats.zero_base_compressed += ranges.base_zero ? 1 : 0;
+  stats.zero_mips_compressed += ranges.mips_zero ? 1 : 0;
+  if (TakeAndroidLogSlot(logged, kAndroidZeroTextureLogLimit)) {
+    LogAndroidTextureRanges("TEXZERO", "guest data all zero when loaded", texture, ranges);
+  }
+}
+
+void CountAndroidReloadAfterZero(TextureCache::AndroidTextureLoadStats& stats,
+                                 const AndroidTextureDescription& texture,
+                                 const AndroidTextureRanges& ranges) {
+  static uint32_t logged = 0;
+  ++stats.reloaded_after_zero;
+  if (IsBlockCompressedGuestFormat(texture.format) &&
+      TakeAndroidLogSlot(logged, kAndroidReloadedTextureLogLimit)) {
+    LogAndroidTextureRanges("TEXRELOAD", "loaded again with data after an all-zero load", texture,
+                            ranges);
+  }
+}
+
+}  // namespace
+
+// Resolves and memexports write only the GPU's copy of guest memory.
+bool TextureCache::IsAndroidGuestRangeGpuWritten(uint32_t guest_address, uint32_t length) const {
+  return length && shared_memory().IsRangeGpuWritten(guest_address, length);
+}
+
+bool TextureCache::IsAndroidGuestRangeZero(uint32_t guest_address, uint32_t length) const {
+  if (!length) {
+    return false;
+  }
+  return AreBytesZero(
+      shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(guest_address), length);
+}
+
+void TextureCache::RecordAndroidTextureLoad(Texture& texture, bool load_base, bool load_mips) {
+  ++android_texture_load_stats_.loads;
+  const TextureKey& key = texture.key();
+  if (!android_texture_zero_check_ || key.scaled_resolve) {
+    return;
+  }
+  AndroidTextureRanges ranges = {uint32_t(key.base_page) << 12,
+                                 load_base ? texture.GetGuestBaseSize() : 0, false,
+                                 uint32_t(key.mip_page) << 12,
+                                 load_mips ? texture.GetGuestMipsSize() : 0, false};
+  const bool base_gpu_written = IsAndroidGuestRangeGpuWritten(ranges.base_address, ranges.base_size);
+  const bool mips_gpu_written = IsAndroidGuestRangeGpuWritten(ranges.mips_address, ranges.mips_size);
+  if (base_gpu_written || mips_gpu_written) {
+    ++android_texture_load_stats_.gpu_written;
+  }
+  ranges.base_zero =
+      !base_gpu_written && IsAndroidGuestRangeZero(ranges.base_address, ranges.base_size);
+  ranges.mips_zero =
+      !mips_gpu_written && IsAndroidGuestRangeZero(ranges.mips_address, ranges.mips_size);
+  const AndroidTextureDescription description = {
+      key.format,         key.GetLogDimensionName(),        key.GetWidth(),
+      key.GetHeight(),    key.GetDepthOrArraySize(),        uint32_t(key.mip_max_level) + 1};
+  const bool zero = ranges.base_zero || ranges.mips_zero;
+  if (texture.android_last_load_zero() && !zero) {
+    CountAndroidReloadAfterZero(android_texture_load_stats_, description, ranges);
+  }
+  texture.set_android_last_load_zero(zero);
+  if (zero) {
+    CountAndroidZeroLoad(android_texture_load_stats_, description, ranges);
+  }
+}
+
+TextureCache::AndroidTextureLoadStats TextureCache::TakeAndroidTextureLoadStats() {
+  AndroidTextureLoadStats stats =
+      std::exchange(android_texture_load_stats_, AndroidTextureLoadStats{});
+  stats.invalidations = android_texture_invalidations_.exchange(0, std::memory_order_relaxed);
+  return stats;
+}
+#endif
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
@@ -734,6 +973,9 @@ void TextureCache::Texture::MarkAsUsed() {
 
 void TextureCache::Texture::WatchCallback(
     [[maybe_unused]] const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip) {
+#if REX_PLATFORM_ANDROID
+  texture_cache_.android_texture_invalidations_.fetch_add(1, std::memory_order_relaxed);
+#endif
   if (is_mip) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = true;
@@ -747,6 +989,45 @@ void TextureCache::Texture::WatchCallback(
   }
 }
 
+void TextureCache::Texture::ForceOutdated(const std::unique_lock<std::recursive_mutex>& global_lock) {
+  SharedMemory& shared_memory = texture_cache().shared_memory();
+  if (GetGuestBaseSize() != 0) {
+    if (base_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(base_watch_handle_);
+    }
+    WatchCallback(global_lock, false);
+  }
+  if (GetGuestMipsSize() != 0) {
+    if (mips_watch_handle_) {
+      shared_memory.UnwatchMemoryRange(mips_watch_handle_);
+    }
+    WatchCallback(global_lock, true);
+  }
+}
+
+void TextureCache::MarkTexturesOutdated(const std::function<bool(Texture&)>& predicate) {
+  auto global_lock = global_critical_region_.Acquire();
+  for (auto& pair : textures_) {
+    Texture& texture = *pair.second;
+    if (predicate(texture)) {
+      texture.ForceOutdated(global_lock);
+    }
+  }
+  texture_became_outdated_.store(true, std::memory_order_release);
+}
+
+void TextureCache::ForEachTextureAtBasePage(uint32_t base_page,
+                                            const std::function<void(Texture&)>& visit) {
+  auto range = textures_by_base_page_.equal_range(base_page);
+  for (auto it = range.first; it != range.second; ++it) {
+    visit(*it->second);
+  }
+}
+
+void TextureCache::MakeTextureUpToDateAndWatch(Texture& texture) {
+  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
+}
+
 void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock,
                                  void* context, void* data, uint64_t argument,
                                  bool invalidated_by_gpu) {
@@ -757,6 +1038,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
 
 void TextureCache::DestroyAllTextures(bool from_destructor) {
   ResetTextureBindings(from_destructor);
+  textures_by_base_page_.clear();
   textures_.clear();
   COUNT_profile_set("gpu/texture_cache/textures", 0);
 }
@@ -874,6 +1156,7 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     }
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
+    textures_by_base_page_.emplace(uint32_t(key.base_page), texture);
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");

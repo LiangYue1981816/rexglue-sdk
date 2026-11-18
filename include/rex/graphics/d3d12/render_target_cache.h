@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -65,10 +66,10 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 
-  void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
+  void WriteEdramRawSRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle, bool second_half = false);
   void WriteEdramRawUAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle);
   void WriteEdramUintPow2SRVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
-                                       uint32_t element_size_bytes_pow2);
+                                       uint32_t element_size_bytes_pow2, bool second_half = false);
   void WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                        uint32_t element_size_bytes_pow2);
 
@@ -152,6 +153,22 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   //  host float32 depth at the same time).
   ID3D12Resource* edram_buffer_ = nullptr;
   D3D12_RESOURCE_STATES edram_buffer_state_;
+
+  // Pixel shader interlock: the resolve shaders address 2048 tiles from the start of the view they are given. A
+  // resolve of a target in the second 2048 tiles (bit 11 of its base) reads them through the second half's views.
+  // If it also clears, the tiles are swapped with the same tiles of the first half around the resolve through two
+  // scratch buffers (the clear shaders write through the first half's view).
+  bool resolve_source_second_half_ = false;
+  bool ResolveImpl(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
+                   D3D12TextureCache& texture_cache, uint32_t& written_address_out,
+                   uint32_t& written_length_out);
+  bool IsResolveSourceInEdramSecondHalf() const;
+  bool GetEdramSecondHalfResolveClearSpan(const memory::Memory& memory, uint32_t& tile_start_out,
+                                          uint32_t& tile_count_out) const;
+  void SwapEdramHalfIn(uint32_t tile_start, uint32_t tile_count);
+  void SwapEdramHalfOut(uint32_t tile_start, uint32_t tile_count);
+  ID3D12Resource* edram_swap_buffers_[2] = {};
+  D3D12_RESOURCE_STATES edram_swap_buffer_states_[2] = {};
   EdramBufferModificationStatus edram_buffer_modification_status_ =
       EdramBufferModificationStatus::kUnmodified;
 
@@ -167,6 +184,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     kR32UintUAV,
     kR32G32UintUAV,
     kR32G32B32A32UintUAV,
+    // The second 2048 tiles of the virtual EDRAM (pixel shader interlock path), for resolves.
+    kRawSRVSecondHalf,
+    kR32UintSRVSecondHalf,
+    kR32G32UintSRVSecondHalf,
+    kR32G32B32A32UintSRVSecondHalf,
 
     kCount,
   };
@@ -409,6 +431,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
       // + 1 bit because this is a signed difference between two EDRAM bases.
       // 0 for host_depth_source_is_copy (ignored in this case anyway as
       // destination == source anyway).
+      // Not widened for 12-bit bases (gpu_native_surfaces) - the fields fill
+      // all 32 bits. The truncated difference is the same modulo
+      // xenos::kEdramTileCount, which the shader wraps the source tile index
+      // to; RenderTargetCache::DropNativeWideTransfers removes the transfers
+      // for which that wrapping is wrong.
       int32_t source_to_dest : xenos::kEdramBaseTilesBits + 1;
     };
     TransferAddressConstant() : constant(0) { static_assert_size(*this, sizeof(constant)); }
@@ -495,9 +522,11 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
     uint32_t offsets;
     struct {
       // May be beyond the EDRAM tile count in case of EDRAM addressing
-      // wrapping, thus + 1 bit.
-      uint32_t dispatch_first_tile : xenos::kEdramBaseTilesBits + 1;
-      uint32_t source_base_tiles : xenos::kEdramBaseTilesBits;
+      // wrapping, thus + 1 bit. Both are in the ownership map's address space,
+      // with 12-bit render target bases with gpu_native_surfaces; the dump
+      // shader wraps the EDRAM buffer address to xenos::kEdramTileCount.
+      uint32_t dispatch_first_tile : xenos::kEdramVirtualBaseTilesBits + 1;
+      uint32_t source_base_tiles : xenos::kEdramVirtualBaseTilesBits;
     };
     DumpOffsets() : offsets(0) { static_assert_size(*this, sizeof(offsets)); }
     bool operator==(const DumpOffsets& other_offsets) const {
@@ -654,6 +683,63 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   bool DumpRenderTargets(uint32_t dump_base, uint32_t dump_row_length_used, uint32_t dump_rows,
                          uint32_t dump_pitch);
 
+  // gpu_native_resolves: why a resolve or a texture was not written natively.
+  enum class NativeResolveFallback : uint32_t {
+    kDepth,
+    kMsaa,
+    kExpBias,
+    kSwap,
+    kNoSource,
+    kMultipleSources,
+    kPartialSource,
+    kSourceFormat,
+    kDestFormat,
+    kDestArray,
+    kDestBaseAdjusted,
+    kEndian,
+    kHalfPixelFill,
+    kSourcePlacement,
+    kTextureIncompatible,
+    kTextureNotUpToDate,
+    kTextureReplacement,
+    kTextureOutside,
+    kTextureNoUAV,
+    kNoPipeline,
+    kDescriptors,
+    kCount,
+  };
+  static const char* const kNativeResolveFallbackNames[size_t(NativeResolveFallback::kCount)];
+  // gpu_native_resolves: the source render target and destination texture formats written.
+  enum class NativeResolvePair : uint32_t {
+    // Color k_16_16_16_16_FLOAT to k_16_16_16_16_FLOAT, copied or scaled by the exponent bias.
+    k16161616Float,
+    // Color k_16_16_FLOAT to k_16_16_FLOAT, copied.
+    k1616Float,
+    // Color k_2_10_10_10_FLOAT to k_16_16_16_16_FLOAT, scaled by the exponent bias.
+    k2101010FloatTo16161616Float,
+    // Color k_8_8_8_8 to k_8_8_8_8, copied or with red and blue swapped.
+    k8888,
+    // Depth kD24S8 to k_24_8.
+    kD24S8,
+    // Depth kD24FS8 to k_24_8_FLOAT.
+    kD24FS8,
+    kCount,
+  };
+  static const char* const kNativeResolvePairNames[size_t(NativeResolvePair::kCount)];
+  // Whether a host render target resolve copy may be written to the textures natively, counting
+  // the reason if not.
+  bool IsNativeResolveEligible(const draw_util::ResolveInfo& resolve_info);
+  // After DumpRenderTargets and MarkRangeAsResolved for the resolve, copies the resolved region
+  // from the source host render target into the texture cache textures viewing the destination
+  // that were up to date before the resolve, and marks them up to date.
+  void WriteResolveToTextures(const draw_util::ResolveInfo& resolve_info,
+                              D3D12TextureCache& texture_cache);
+  void CountNativeResolveFallback(NativeResolveFallback reason, uint64_t count = 1) {
+    native_resolve_fallbacks_[size_t(reason)] += count;
+  }
+  // Logs the native resolve counts every few seconds.
+  void ReportNativeResolves();
+
   bool use_stencil_reference_output_ = false;
 
   bool gamma_render_target_as_unorm16_ = false;
@@ -732,6 +818,15 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   uint64_t direct_resolve_attempt_count_ = 0;
   uint64_t direct_resolve_success_count_ = 0;
   uint64_t direct_resolve_fallback_count_ = 0;
+
+  // gpu_native_resolves: textures written and fallbacks since the last report.
+  uint64_t native_resolve_written_ = 0;
+  std::array<uint64_t, size_t(NativeResolvePair::kCount)> native_resolve_written_pairs_ = {};
+  std::array<uint64_t, size_t(NativeResolveFallback::kCount)> native_resolve_fallbacks_ = {};
+  // gpu_native_hook_example: written textures desaturated since the last report.
+  uint64_t native_resolve_hook_example_ = 0;
+  std::chrono::steady_clock::time_point native_resolve_last_report_ =
+      std::chrono::steady_clock::now();
 
   // Parameter 0 - 2 root constants (red, green).
   ID3D12RootSignature* uint32_rtv_clear_root_signature_ = nullptr;

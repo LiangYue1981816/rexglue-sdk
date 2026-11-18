@@ -15,15 +15,115 @@
 #include <numeric>
 #include <tuple>
 
+#include <rex/platform.h>
 #include <rex/string/utf8.h>
 
 #define UTF_CPP_CPLUSPLUS 201703L
 #include <utf8.h>
 
+#if REX_PLATFORM_LINUX
+#include <atomic>
+#include <iterator>
+
+#include <fmt/format.h>
+
+#include <rex/logging.h>
+#endif
+
 namespace utfcpp = utf8;
 
 using citer = std::string_view::const_iterator;
 using utf8_citer = utfcpp::iterator<std::string_view::const_iterator>;
+
+#if REX_PLATFORM_LINUX
+// Guest content names are raw bytes and can hold invalid UTF-8. utfcpp throws on them, and on
+// Android that exception unwinds through recompiled guest code and kernel exports into
+// std::terminate. So, as the gow2 port's Windows UTF-8 guard does for this same instantiation, an
+// invalid, overlong, surrogate, out-of-range or truncated sequence decodes its lead byte as a
+// one-byte code point and the decode moves one byte on. Android and Linux; Windows keeps utfcpp's.
+namespace {
+
+constexpr uint32_t kMaxLoggedUtf8Repairs = 24;
+std::atomic<uint32_t> g_utf8_repairs{0};
+
+struct Utf8Lead {
+  size_t extra = 0;
+  uint32_t bits = 0;
+  uint32_t lowest = 0;
+};
+
+bool ReadUtf8Lead(uint8_t c, Utf8Lead& lead) {
+  if ((c & 0xE0) == 0xC0) {
+    lead = {1, c & 0x1Fu, 0x80};
+  } else if ((c & 0xF0) == 0xE0) {
+    lead = {2, c & 0x0Fu, 0x800};
+  } else if ((c & 0xF8) == 0xF0) {
+    lead = {3, c & 0x07u, 0x10000};
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool IsValidCodePoint(uint32_t cp, uint32_t lowest) {
+  return cp >= lowest && cp <= 0x10FFFFu && (cp < 0xD800u || cp > 0xDFFFu);
+}
+
+void NoteUtf8Repair(citer at, citer end, uint8_t lead) {
+  const uint32_t n = g_utf8_repairs.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n > kMaxLoggedUtf8Repairs) {
+    return;
+  }
+  std::string hex;
+  for (size_t i = 0; at != end && i < kMaxLoggedUtf8Repairs; ++at, ++i) {
+    fmt::format_to(std::back_inserter(hex), "{:02x} ", static_cast<uint8_t>(*at));
+  }
+  REXLOG_WARN("utf8: invalid sequence #{}: lead {:#04x} decoded as one byte, bytes=[{}]", n,
+              lead, hex);
+}
+
+char32_t RepairUtf8(citer& it, citer end, uint8_t lead) {
+  NoteUtf8Repair(it, end, lead);
+  ++it;
+  return lead;
+}
+
+}  // namespace
+
+namespace utf8 {
+
+template <>
+utfchar32_t next<citer>(citer& it, citer end) {
+  if (it >= end) {
+    return 0;
+  }
+  const auto c = static_cast<uint8_t>(*it);
+  if (c < 0x80) {
+    ++it;
+    return c;
+  }
+  Utf8Lead lead;
+  if (!ReadUtf8Lead(c, lead)) {
+    return RepairUtf8(it, end, c);
+  }
+  uint32_t cp = lead.bits;
+  size_t read = 0;
+  for (citer q = it + 1; read < lead.extra && q < end; ++q, ++read) {
+    const auto b = static_cast<uint8_t>(*q);
+    if ((b & 0xC0) != 0x80) {
+      break;
+    }
+    cp = (cp << 6) | (b & 0x3Fu);
+  }
+  if (read < lead.extra || !IsValidCodePoint(cp, lead.lowest)) {
+    return RepairUtf8(it, end, c);
+  }
+  it += static_cast<std::ptrdiff_t>(1 + lead.extra);
+  return cp;
+}
+
+}  // namespace utf8
+#endif  // REX_PLATFORM_LINUX
 
 namespace rex::string {
 

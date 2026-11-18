@@ -32,6 +32,20 @@ REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
 REXCVAR_DEFINE_BOOL(present_letterbox, true, "UI/Presenter",
                     "Enable letterboxing for non-native aspect ratios");
 
+REXCVAR_DEFINE_BOOL(present_screenshot_key_enabled, true, "Display",
+                    "Capture a screenshot when F12 is pressed");
+
+REXCVAR_DEFINE_BOOL(present_hdr, false, "Display", "Enable HDR10 output (requires restart)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(present_hdr_paper_white_nits, 200, "Display",
+                     "HDR paper white luminance in nits")
+    .range(80, 500);
+
+REXCVAR_DEFINE_INT32(present_hdr_peak_nits, 1000, "Display",
+                     "HDR peak luminance in nits")
+    .range(400, 10000);
+
 REXCVAR_DEFINE_INT32(present_safe_area_x, 90, "UI/Presenter",
                      "Horizontal safe area percentage (0-100)")
     .range(0, 100);
@@ -41,10 +55,17 @@ REXCVAR_DEFINE_INT32(present_safe_area_y, 90, "UI/Presenter",
     .range(0, 100);
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_STRING(present_effect, "fsr", "UI/Presenter",
+                      "Guest output effect: bilinear, cas, fsr, sgsr")
+    .allowed({"bilinear", "cas", "fsr", "sgsr"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
 REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter",
                       "Guest output effect: bilinear, cas, fsr, fsr2, fsr3")
     .allowed({"bilinear", "cas", "fsr", "fsr2", "fsr3"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_DOUBLE(present_cas_additional_sharpness,
                       rex::ui::Presenter::GuestOutputPaintConfig::kCasAdditionalSharpnessDefault,
@@ -59,12 +80,20 @@ REXCVAR_DEFINE_INT32(present_fsr_max_upsampling_passes,
     .range(1, int32_t(rex::ui::Presenter::GuestOutputPaintConfig::kFsrMaxUpscalingPassesMax))
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction, 0.3,
+                      "UI/Presenter", "FSR RCAS sharpness reduction in stops")
+    .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
+           rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
 REXCVAR_DEFINE_DOUBLE(present_fsr_sharpness_reduction,
                       rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionDefault,
                       "UI/Presenter", "FSR RCAS sharpness reduction in stops")
     .range(rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMin,
            rex::ui::Presenter::GuestOutputPaintConfig::kFsrSharpnessReductionMax)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_STRING(
     present_fsr_quality_mode, "auto", "UI/Presenter",
@@ -77,9 +106,15 @@ REXCVAR_DEFINE_STRING(present_effect, "bilinear", "UI/Presenter", "Guest output 
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 #endif
 
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_BOOL(present_dither, true, "UI/Presenter",
+                    "Enable output dithering in the final present pass")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#else
 REXCVAR_DEFINE_BOOL(present_dither, false, "UI/Presenter",
                     "Enable output dithering in the final present pass")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
 
 REXCVAR_DEFINE_BOOL(present_allow_overscan_cutoff, false, "UI/Presenter",
                     "Allow overscan cutoff based on safe area settings")
@@ -104,6 +139,11 @@ GuestOutputPaintConfig::Effect ParsePresentEffect(const std::string& effect_name
   }
   if (lowered == "fsr3") {
     return GuestOutputPaintConfig::Effect::kFsr3;
+  }
+#endif
+#if REX_PLATFORM_ANDROID
+  if (lowered == "sgsr") {
+    return GuestOutputPaintConfig::Effect::kSgsr1;
   }
 #endif
   return GuestOutputPaintConfig::Effect::kBilinear;
@@ -272,6 +312,19 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
   return config;
 }
 
+// The sharpness and dither only change shader constants, so they follow their cvars at runtime; a
+// different effect needs a restart (effects present_effect cannot reach are never compiled).
+constexpr std::string_view kLivePaintCvars[] = {"present_cas_additional_sharpness",
+                                                "present_fsr_sharpness_reduction", "present_dither"};
+
+void ApplyLivePaintCvars(GuestOutputPaintConfig& config) {
+#if defined(REX_HAS_FIDELITYFX_SDK)
+  config.SetCasAdditionalSharpness(float(REXCVAR_GET(present_cas_additional_sharpness)));
+  config.SetFsrSharpnessReduction(float(REXCVAR_GET(present_fsr_sharpness_reduction)));
+#endif
+  config.SetDither(REXCVAR_GET(present_dither));
+}
+
 }  // namespace
 
 namespace rex {
@@ -286,6 +339,8 @@ Presenter::~Presenter() {
   // No intrusive lifetime management must be performed from UI drawers - defer
   // it if needed.
   assert_false(is_executing_ui_drawers_);
+
+  for (std::string_view name : kLivePaintCvars) rex::cvar::UnregisterChangeCallbacks(name);
 
 #if REX_PLATFORM_WIN32
   if (dxgi_ui_tick_thread_.joinable()) {
@@ -785,10 +840,27 @@ void Presenter::RequestUIPaintFromUIThread() {
   }
 }
 
+#if REX_PLATFORM_ANDROID
+Presenter::GuestOutputPaintConfig::Effect Presenter::GetConfiguredGuestOutputPaintEffect() {
+  return ParsePresentEffect(REXCVAR_GET(present_effect));
+}
+#endif
+
 bool Presenter::InitializeCommonSurfaceIndependent() {
   {
     std::lock_guard<std::mutex> config_lock(guest_output_paint_config_mutex_);
     guest_output_paint_config_ = BuildGuestOutputPaintConfigFromCVar();
+  }
+  for (std::string_view name : kLivePaintCvars) {
+    rex::cvar::RegisterChangeCallback(name, [this](std::string_view, std::string_view) {
+      Window* window = window_;
+      if (!window) return;
+      window->app_context().CallInUIThread([this] {
+        GuestOutputPaintConfig config = guest_output_paint_config_;
+        ApplyLivePaintCvars(config);
+        SetGuestOutputPaintConfigFromUIThread(config);
+      });
+    });
   }
 
   // Initialize UI frame rate limiting.
@@ -1146,6 +1218,16 @@ Presenter::GuestOutputPaintFlow Presenter::GetGuestOutputPaintFlow(
     }
   }
 #endif  // defined(REX_HAS_FIDELITYFX_SDK)
+
+#if REX_PLATFORM_ANDROID
+  if (config.GetEffect() == GuestOutputPaintConfig::Effect::kSgsr1 &&
+      (properties.frontbuffer_width < output_width ||
+       properties.frontbuffer_height < output_height)) {
+    assert_true(flow.effect_count < flow.effects.size());
+    flow.effect_output_sizes[flow.effect_count] = std::make_pair(output_width, output_height);
+    flow.effects[flow.effect_count++] = GuestOutputPaintEffect::kSgsr1;
+  }
+#endif
 
   std::pair<uint32_t, uint32_t>* last_pre_bilinear_effect_size =
       flow.effect_count ? &flow.effect_output_sizes[flow.effect_count - 1] : nullptr;

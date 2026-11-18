@@ -39,6 +39,11 @@
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/api.h>
 
+#if REX_PLATFORM_ANDROID
+#include <chrono>
+#include <rex/graphics/vulkan/pipeline_cache_file.h>
+#endif
+
 namespace rex::graphics::vulkan {
 
 class VulkanCommandProcessor;
@@ -334,6 +339,15 @@ class VulkanPipelineCache {
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
+#if REX_PLATFORM_ANDROID
+  // Diagnostics (vulkan_android_depth_experiment bits 16 and 1024,
+  // vulkan_android_paint_shader_hashes): the draws they select write magenta instead of the
+  // guest shader's output.
+  void CreatePaintFragmentShader();
+  bool IsAnyAndroidPaintRequested() const;
+  bool IsPaintedWithoutPixelShader(const PipelineDescription& description) const;
+  bool IsPaintedPipeline(const PipelineDescription& description, bool has_pixel_shader) const;
+#endif
   bool GetCurrentStateDescription(
       const VulkanShader::VulkanTranslation* vertex_shader,
       const VulkanShader::VulkanTranslation* pixel_shader,
@@ -369,6 +383,17 @@ class VulkanPipelineCache {
                              VkShaderModule fragment_shader_override = VK_NULL_HANDLE);
   void CreationThread(size_t thread_index);
   void CreateQueuedPipelinesOnProcessorThread();
+#if REX_PLATFORM_ANDROID
+  void CreateEmptyFragmentShader();
+  bool NeedsEmptyFragmentShader(const PipelineDescription& description) const;
+  bool CanQueueWithoutPlaceholder() const;
+  static bool IsPendingWithoutPlaceholder(const Pipeline& pipeline);
+  void QueuePendingPipelineCreation(const PipelineCreationArguments& creation_arguments);
+  bool ReturnPendingPipeline(std::pair<const PipelineDescription, Pipeline>& pipeline,
+                             VkPipeline& pipeline_out,
+                             const PipelineLayoutProvider*& pipeline_layout_out,
+                             void** pipeline_handle_out);
+#endif
   void ProcessDeferredPipelineDestructions(bool force_all);
 
   VulkanCommandProcessor& command_processor_;
@@ -420,6 +445,13 @@ class VulkanPipelineCache {
   // provided in host render target mode.
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
+#if REX_PLATFORM_ANDROID
+  // For pipelines without a Xenos pixel shader that have color targets bound
+  // (vulkan_android_empty_fragment_shader).
+  VkShaderModule empty_fragment_shader_ = VK_NULL_HANDLE;
+  VkShaderModule paint_fragment_shader_ = VK_NULL_HANDLE;
+  std::vector<uint64_t> android_paint_shader_hashes_;
+#endif
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
 
@@ -446,6 +478,20 @@ class VulkanPipelineCache {
 
   // Thread for asynchronous writing to the storage streams.
   void StorageWriteThread();
+#if REX_PLATFORM_ANDROID
+  void OpenAndroidPipelineCache(const std::filesystem::path& path);
+  void RequestAndroidPipelineCacheSave();
+  void SaveAndroidPipelineCache();
+  pipeline_cache_file::DeviceIdentity GetAndroidDeviceIdentity() const;
+
+  std::atomic<VkPipelineCache> android_pipeline_cache_{VK_NULL_HANDLE};
+  std::filesystem::path android_pipeline_cache_path_;
+  std::atomic<uint32_t> android_pipelines_since_cache_save_{0};
+  std::chrono::steady_clock::time_point android_pipeline_cache_save_requested_at_{};
+  uint64_t android_pipeline_cache_saved_hash_ = 0;
+  // Protected by storage_write_request_lock_.
+  bool storage_write_save_pipeline_cache_ = false;
+#endif
   std::mutex storage_write_request_lock_;
   std::condition_variable storage_write_request_cond_;
   // Storage thread input is protected with storage_write_request_lock_, and the

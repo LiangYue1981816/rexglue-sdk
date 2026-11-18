@@ -305,7 +305,55 @@ bool D3D12Provider::Initialize() {
 
   // Create the Direct3D 12 device.
   ID3D12Device* device;
-  if (FAILED(pfn_d3d12_create_device_(adapter, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device)))) {
+#ifdef GOW2_DEV_TOOLS
+  // GOW2_D3D12_DEBUG=1: enable the debug layer (messages are logged through the info queue).
+  const bool gow2_debug_layer = [] {
+    const char* e = std::getenv("GOW2_D3D12_DEBUG");
+    return e && *e == '1';
+  }();
+  if (gow2_debug_layer) {
+    typedef HRESULT(WINAPI * PFN_GetDebugInterface)(REFIID, void**);
+    auto get_debug = reinterpret_cast<PFN_GetDebugInterface>(
+        GetProcAddress(library_d3d12_, "D3D12GetDebugInterface"));
+    ID3D12Debug* debug = nullptr;
+    if (get_debug && SUCCEEDED(get_debug(IID_PPV_ARGS(&debug)))) {
+      debug->EnableDebugLayer();
+      debug->Release();
+      REXGPU_WARN("D3D12 debug layer enabled");
+    }
+  }
+#else
+  const bool gow2_debug_layer = false;
+#endif
+  // Prefer feature level 12_x (required by vendor upscalers such as DLSS), fall back to 11_0.
+  D3D_FEATURE_LEVEL chosen_level = D3D_FEATURE_LEVEL_12_1;
+  HRESULT create_hr = E_FAIL;
+  for (D3D_FEATURE_LEVEL level :
+       {D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_11_0}) {
+    create_hr = pfn_d3d12_create_device_(adapter, level, IID_PPV_ARGS(&device));
+    if (SUCCEEDED(create_hr)) {
+      chosen_level = level;
+      break;
+    }
+  }
+  REXGPU_INFO("D3D12 device feature level 0x{:X}", uint32_t(chosen_level));
+#ifdef GOW2_DEV_TOOLS
+  if (gow2_debug_layer && SUCCEEDED(create_hr)) {
+    ID3D12InfoQueue1* iq1 = nullptr;
+    if (SUCCEEDED(device->QueryInterface(IID_PPV_ARGS(&iq1)))) {
+      DWORD cookie = 0;
+      iq1->RegisterMessageCallback(
+          [](D3D12_MESSAGE_CATEGORY, D3D12_MESSAGE_SEVERITY sev, D3D12_MESSAGE_ID id,
+             LPCSTR desc, void*) {
+            if (sev <= D3D12_MESSAGE_SEVERITY_WARNING)
+              REXGPU_WARN("D3D12 debug [{}] {}", uint32_t(id), desc);
+          },
+          D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr, &cookie);
+      iq1->Release();
+    }
+  }
+#endif
+  if (FAILED(create_hr)) {
     REXLOG_ERROR("Failed to create a Direct3D 12 feature level 11_0 device");
     adapter->Release();
     dxgi_factory->Release();

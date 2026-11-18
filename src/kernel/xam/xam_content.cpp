@@ -297,10 +297,10 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
 
   if (content_exists) {
     if (content_data.content_type == XContentType::kSavedGame) {
-      // User always creates saves.
+      // User always creates saves. Report the XUID the game knows the player by.
       *is_creator_ptr = 1;
       if (creator_xuid_ptr) {
-        *creator_xuid_ptr = xuid;
+        *creator_xuid_ptr = REX_KERNEL_STATE()->user_profile()->network_xuid();
       }
     } else {
       *is_creator_ptr = 0;

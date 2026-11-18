@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/assert.h>
+#include <rex/kernel/xam/xsession.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -158,6 +159,10 @@ u32 ObDereferenceObject_entry(u32 native_ptr) {
   REXKRNL_IMPORT_TRACE("ObDereferenceObject", "ptr={:#x}", (uint32_t)native_ptr);
   // Check if a dummy value from ObReferenceObjectByHandle.
   if (native_ptr == 0xDEADF00D) {
+    return 0;
+  }
+  // XSession objects are plain guest blocks, not dispatcher objects.
+  if (rex::kernel::xam::SessionRegistry().IsObject(native_ptr)) {
     return 0;
   }
 

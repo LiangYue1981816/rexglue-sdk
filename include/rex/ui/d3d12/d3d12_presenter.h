@@ -12,12 +12,15 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
 #include <utility>
 
 #include <rex/math.h>
+#include <rex/ui/d3d12/d3d12_hdr.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_submission_tracker.h>
+#include <rex/ui/d3d12/d3d12_swap_chain_source.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/surface.h>
 
@@ -83,9 +86,12 @@ class D3D12Presenter final : public Presenter {
 
   const D3D12Provider& provider() const { return provider_; }
 
+  virtual void SetSwapChainSource(SwapChainSource* source);
+
   Surface::TypeFlags GetSupportedSurfaceTypes() const override;
 
   bool CaptureGuestOutput(RawImage& image_out) override;
+  void RequestScreenshot() override;
 
   void AwaitUISubmissionCompletionFromUIThread(UINT64 submission_index) {
     ui_submission_tracker_.AwaitSubmissionCompletion(submission_index);
@@ -183,7 +189,10 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+      kRTVIndexHDRPicture = kRTVIndexGuestOutputIntermediate0 + kMaxGuestOutputPaintEffects - 1,
+      kRTVIndexHDRUI,
+
+      kRTVCount = kRTVIndexHDRUI + 1,
     };
 
     enum ViewIndex : UINT {
@@ -195,7 +204,11 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kViewIndexGuestOutputIntermediate0Srv = kViewIndexGuestOutput0Srv + kGuestOutputMailboxSize,
 
-      kViewCount = kViewIndexGuestOutputIntermediate0Srv + kMaxGuestOutputPaintEffects - 1,
+      kViewIndexHDRPictureSrv = kViewIndexGuestOutputIntermediate0Srv +
+                                kMaxGuestOutputPaintEffects - 1,
+      kViewIndexHDRUISrv,
+
+      kViewCount = kViewIndexHDRUISrv + 1,
     };
 
     void AwaitSwapChainUsageCompletion() {
@@ -251,8 +264,21 @@ class D3D12Presenter final : public Presenter {
     uint32_t swap_chain_width = 0;
     uint32_t swap_chain_height = 0;
     bool swap_chain_allows_tearing = false;
+    bool hdr_enabled = false;
+    uint32_t hdr_paper_white_nits = 0;
+    uint32_t hdr_peak_nits = 0;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
+    Microsoft::WRL::ComPtr<IDXGISwapChain4> hdr_swap_chain;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
+    Microsoft::WRL::ComPtr<ID3D12Resource> hdr_picture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> hdr_ui;
+    SwapChainSource* swap_chain_source = nullptr;
+    bool swap_chain_from_source = false;
+    bool picture_rect_valid = false;
+    int32_t picture_rect_x = 0;
+    int32_t picture_rect_y = 0;
+    uint32_t picture_rect_width = 0;
+    uint32_t picture_rect_height = 0;
   };
 
   explicit D3D12Presenter(HostGpuLossCallback host_gpu_loss_callback, const D3D12Provider& provider)
@@ -261,6 +287,9 @@ class D3D12Presenter final : public Presenter {
   bool dxgi_supports_tearing() const { return dxgi_supports_tearing_; }
 
   bool InitializeSurfaceIndependent();
+  Microsoft::WRL::ComPtr<IDXGISwapChain1> CreateSwapChainForHwnd(
+      IDXGIFactory2* factory, ID3D12CommandQueue* queue, HWND hwnd,
+      const DXGI_SWAP_CHAIN_DESC1& desc);
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
@@ -274,6 +303,7 @@ class D3D12Presenter final : public Presenter {
 #endif
 
   const D3D12Provider& provider_;
+  SwapChainSource* swap_chain_source_ = nullptr;
 
   // Whether DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING is supported by DXGI (depends in
   // particular on the Windows 10 version and hardware support), primarily for
@@ -289,6 +319,7 @@ class D3D12Presenter final : public Presenter {
       guest_output_paint_intermediate_pipelines_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, size_t(GuestOutputPaintEffect::kCount)>
       guest_output_paint_final_pipelines_;
+  hdr::ComposePipeline hdr_compose_pipeline_;
 
   // The first is the refresher submission tracker fence value at which the
   // guest output texture was last refreshed, the second is the reference to the
@@ -311,6 +342,7 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+  std::atomic<bool> screenshot_requested_ = false;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

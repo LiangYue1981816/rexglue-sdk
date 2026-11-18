@@ -97,6 +97,19 @@ class PipelineCache {
     return reinterpret_cast<const Pipeline*>(handle)->state.load(std::memory_order_acquire);
   }
 
+  // Progress of InitializeShaderStorage, safe to read from any thread (for
+  // example, to report it while the UI thread waits for the storage to load).
+  struct ShaderStorageProgress {
+    uint32_t shaders_done;
+    uint32_t shaders_total;
+    uint32_t pipelines_done;
+    uint32_t pipelines_total;
+  };
+  ShaderStorageProgress GetShaderStorageProgress() const {
+    return {storage_shaders_done_.load(), storage_shaders_total_.load(),
+            storage_pipelines_done_.load(), storage_pipelines_total_.load()};
+  }
+
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
     uint64_t ucode_data_hash;
@@ -291,6 +304,14 @@ class PipelineCache {
   const std::vector<uint32_t>& GetGeometryShader(GeometryShaderKey key);
 
   ID3D12PipelineState* CreateD3D12Pipeline(const PipelineRuntimeDescription& runtime_description);
+
+  // Driver-compiled pipelines kept between runs (ID3D12PipelineLibrary), in shaders/local because
+  // they are only valid for this GPU and driver.
+  void LoadPipelineLibrary(const std::filesystem::path& local_root, uint32_t title_id, bool edram_rov_used);
+  void SavePipelineLibrary();
+  void ReleasePipelineLibrary();
+  ID3D12PipelineState* CreateOrLoadPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& state_desc,
+                                                 uint64_t description_hash);
   bool PrepareRuntimeDescriptionForQueuedCreation(Pipeline* pipeline,
                                                   PipelineRuntimeDescription& runtime_description);
 
@@ -379,6 +400,11 @@ class PipelineCache {
 
   // Pipeline storage output stream, for preload in the next emulator runs.
   FILE* pipeline_storage_file_ = nullptr;
+  ID3D12PipelineLibrary* pipeline_library_ = nullptr;
+  std::vector<uint8_t> pipeline_library_blob_;
+  std::filesystem::path pipeline_library_path_;
+  std::mutex pipeline_library_mutex_;
+  bool pipeline_library_dirty_ = false;
   bool pipeline_storage_file_flush_needed_ = false;
 
   // Thread for asynchronous writing to the storage streams.
@@ -419,6 +445,15 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // Shader storage progress, see GetShaderStorageProgress.
+  std::atomic<uint32_t> storage_shaders_done_{0};
+  std::atomic<uint32_t> storage_shaders_total_{0};
+  std::atomic<uint32_t> storage_pipelines_done_{0};
+  std::atomic<uint32_t> storage_pipelines_total_{0};
+  // Pipeline completions are only counted while the storage is being loaded,
+  // runtime pipeline creation shares the same creation threads.
+  std::atomic<bool> storage_progress_active_{false};
 };
 
 }  // namespace rex::graphics::d3d12

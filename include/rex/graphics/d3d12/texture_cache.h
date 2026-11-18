@@ -12,9 +12,12 @@
 #pragma once
 
 #include <array>
+#include <deque>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -31,6 +34,8 @@
 namespace rex::graphics::d3d12 {
 
 class D3D12CommandProcessor;
+struct GuestTextureDesc;
+class TextureReplacementManager;
 
 class D3D12TextureCache final : public TextureCache {
  public:
@@ -40,6 +45,10 @@ class D3D12TextureCache final : public TextureCache {
     TextureKey key;
     uint32_t host_swizzle;
     uint8_t swizzled_signs;
+    // Sum of descriptor_generation() of the unsigned and the signed textures.
+    // Generations only grow, so this changes whenever either texture switches
+    // its backing resource (texture pack replacement on/off).
+    uint32_t descriptor_generation;
   };
 
   // Sampler parameters that can be directly converted to a host sampler or used
@@ -86,9 +95,14 @@ class D3D12TextureCache final : public TextureCache {
 
   void ClearCache() override;
 
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
+
+  // Creates the texture pack (dump/replace) manager. No-op unless dumping or
+  // replacement is enabled; every use tolerates a null manager (zero cost).
+  void InitializeTextureReplacement(const std::filesystem::path& cache_root, uint32_t title_id);
 
   // Must be called within a submission - creates and untiles textures needed by
   // shaders and puts them in the SRV state. This may bind compute pipelines
@@ -112,6 +126,10 @@ class D3D12TextureCache final : public TextureCache {
   void WriteActiveTextureBindfulSRV(const D3D12Shader::TextureBinding& host_shader_binding,
                                     D3D12_CPU_DESCRIPTOR_HANDLE handle);
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
+
+  // Resource of the texture bound to a fetch constant (nullptr if none); sizes in host texels.
+  ID3D12Resource* GetActiveTextureResource(uint32_t fetch_constant_index, uint32_t* width,
+                                           uint32_t* height) const;
 
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
@@ -152,6 +170,77 @@ class D3D12TextureCache final : public TextureCache {
     assert_true(IsDrawResolutionScaled());
     GetCurrentScaledResolveBuffer().SetUAVBarrierPending();
   }
+
+  // gpu_native_resolves: how the source is written into the textures.
+  enum class NativeResolveMode : uint32_t {
+    // The values of the native_resolve.cs.hlsl modes.
+    // out = in * scale.
+    kScale,
+    // out = in.bgra.
+    kSwapRedBlue,
+    // out.r = depth.
+    kDepthToRed,
+    // CopyTextureRegion.
+    kCopy,
+  };
+  // gpu_native_resolves: a resolve rectangle to copy from a host render target straight into the
+  // textures viewing the resolve destination. Coordinates and sizes are in guest pixels, unscaled.
+  struct NativeResolveWrite {
+    // Physical 4 KB page of the texture base the destination coordinates are relative to.
+    uint32_t base_page;
+    xenos::TextureFormat format;
+    // In TextureKey::pitch units (32 texels).
+    uint32_t pitch;
+    xenos::Endian endianness;
+    // Subresource 0 is read. With kCopy, the format must be in the same typeless family as the
+    // textures'.
+    ID3D12Resource* source;
+    uint32_t source_x;
+    uint32_t source_y;
+    uint32_t dest_x;
+    uint32_t dest_y;
+    uint32_t width;
+    uint32_t height;
+    NativeResolveMode mode = NativeResolveMode::kCopy;
+    // kScale multiplier.
+    float scale = 1.0f;
+    // The resolve's exponent bias (scale is 2^exp_bias for color), for ApplyNativeResolveHooks.
+    int32_t exp_bias = 0;
+    // Shader modes: resolution-scaled host pixel columns / rows at the left / top of the rectangle
+    // taken from the first column / row after them - the half-pixel offset gap fill of the resolve
+    // shaders (ResolveEdramInfo::fill_half_pixel_offset).
+    uint32_t fill_x = 0;
+    uint32_t fill_y = 0;
+    // Shader modes: the non-shader-visible SRV of the source to copy if source_srv_format is
+    // DXGI_FORMAT_UNKNOWN, otherwise a 2D source SRV with source_srv_format is created.
+    D3D12_CPU_DESCRIPTOR_HANDLE source_srv = {};
+    DXGI_FORMAT source_srv_format = DXGI_FORMAT_UNKNOWN;
+    // Shader modes: the format of the UAV of the textures.
+    DXGI_FORMAT dest_uav_format = DXGI_FORMAT_UNKNOWN;
+  };
+  struct NativeResolveWriteCounts {
+    uint32_t written = 0;
+    uint32_t incompatible = 0;
+    uint32_t not_up_to_date = 0;
+    uint32_t replacement = 0;
+    uint32_t outside = 0;
+    // Shader modes: the texture was created without D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.
+    uint32_t no_uav = 0;
+    // Shader modes: native_resolve_cs pipeline not created.
+    uint32_t no_pipeline = 0;
+    // Shader modes: failed to get the one-use descriptors.
+    uint32_t descriptors = 0;
+    // Written textures gpu_native_hook_example was applied to.
+    uint32_t hook_example = 0;
+  };
+  // Writes the rectangle into every texture at write.base_page that is a single-level unsigned 2D
+  // tiled texture with the format, pitch and endianness of the resolve, matching resolution
+  // scaling, and up to date before the resolve (CaptureUpToDateBeforeResolve), then marks those
+  // up to date. source_state is the current state of the source, updated if it's transitioned.
+  // kCopy uses CopyTextureRegion, the other modes native_resolve_cs.
+  void WriteNativeResolveToTextures(const NativeResolveWrite& write,
+                                    D3D12_RESOURCE_STATES& source_state,
+                                    NativeResolveWriteCounts& counts);
 
   // Returns the ID3D12Resource of the front buffer texture (in
   // NON_PIXEL_SHADER_RESOURCE state), or nullptr in case of failure, and writes
@@ -252,6 +341,33 @@ class D3D12TextureCache final : public TextureCache {
     ~D3D12Texture();
 
     ID3D12Resource* resource() const { return resource_.Get(); }
+    ID3D12Resource* replacement_resource() const { return replacement_resource_.Get(); }
+    DXGI_FORMAT replacement_format() const { return replacement_format_; }
+    uint32_t replacement_mip_levels() const { return replacement_mip_levels_; }
+    uint64_t replacement_hash() const { return replacement_hash_; }
+    // The variant epoch the replacement was chosen under (TextureReplacementManager::variant_epoch).
+    uint32_t replacement_epoch() const { return replacement_epoch_; }
+    void set_replacement_epoch(uint32_t epoch) { replacement_epoch_ = epoch; }
+    uint64_t last_content_hash() const { return last_content_hash_; }
+    bool has_replacement() const { return replacement_resource_ != nullptr; }
+    uint32_t descriptor_generation() const { return descriptor_generation_; }
+
+    // Content that changes on almost every load (video planes, CPU-animated textures) is
+    // not a static asset: after this many changes it is no longer hashed, dumped or replaced.
+    static constexpr uint32_t kDynamicContentChanges = 2;
+    bool is_dynamic_content() const { return content_changes_ >= kDynamicContentChanges; }
+    // Records the content hash of a load; false once the texture counts as dynamic.
+    bool NoteContentHash(uint64_t hash);
+
+    // Switches sampling to an already uploaded replacement resource, retiring
+    // the current descriptors and the previous replacement resource for
+    // deferred release (command lists in flight may still reference them).
+    void SetReplacement(ID3D12Resource* resource, DXGI_FORMAT format, uint32_t mip_levels,
+                        uint64_t hash);
+    // Switches sampling back to the guest resource, retiring the current
+    // descriptors and the replacement resource the same way. No-op when no
+    // replacement is active.
+    void ClearReplacement();
 
     D3D12_RESOURCE_STATES SetResourceState(D3D12_RESOURCE_STATES new_state) {
       D3D12_RESOURCE_STATES old_state = resource_state_;
@@ -272,6 +388,19 @@ class D3D12TextureCache final : public TextureCache {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
+    // Texture pack replacement ("4K packs"). Owned by the guest texture so its
+    // lifetime follows the TextureKey, LRU and invalidation. Always in
+    // NON_PIXEL_SHADER_RESOURCE | PIXEL_SHADER_RESOURCE state once uploaded.
+    Microsoft::WRL::ComPtr<ID3D12Resource> replacement_resource_;
+    DXGI_FORMAT replacement_format_ = DXGI_FORMAT_UNKNOWN;
+    uint32_t replacement_mip_levels_ = 0;
+    uint64_t replacement_hash_ = 0;
+    uint32_t replacement_epoch_ = 0;
+    // Bumped every time the backing resource for views changes, so stale
+    // externally cached descriptor indices are rewritten (TextureSRVKey).
+    uint32_t descriptor_generation_ = 0;
+    uint64_t last_content_hash_ = 0;
+    uint32_t content_changes_ = 0;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
     // copying to the shader-visible heap (much faster than recreating, which,
@@ -403,6 +532,15 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
                                          bool is_signed, uint32_t host_swizzle);
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
+  // Retires a descriptor index or a resource replaced on a texture for release
+  // once the submission that may still reference it completes.
+  void DeferTextureDescriptorRelease(uint32_t descriptor_index, uint64_t submission);
+  void DeferTextureResourceRelease(Microsoft::WRL::ComPtr<ID3D12Resource> resource,
+                                   uint64_t submission);
+  // Hashes the freshly loaded guest texture and swaps in a pack replacement
+  // when one matches. Never fails the guest load.
+  void MaybeUpdateReplacement(D3D12Texture& texture);
+  void LogReplacementFailureOnce(uint64_t hash, const char* reason);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 
   size_t GetScaledResolveBufferCount() const {
@@ -457,10 +595,56 @@ class D3D12TextureCache final : public TextureCache {
   D3D12CommandProcessor& command_processor_;
   bool bindless_resources_used_;
 
+  // Texture pack (dump/replace) manager. Null when both texture_dump and
+  // texture_replace are off - the feature is then entirely free.
+  std::unique_ptr<TextureReplacementManager> texture_replacement_;
+  // Descriptor indices and resources retired by SetReplacement/ClearReplacement
+  // while command lists in flight may still reference them, tagged with the
+  // submission index at the time of the change.
+  std::deque<std::pair<uint64_t, uint32_t>> retired_srv_descriptors_;
+  std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>> retired_resources_;
+  // Replacement upload/creation failures already logged (once per hash).
+  std::unordered_set<uint64_t> replacement_failure_hashes_;
+
   Microsoft::WRL::ComPtr<ID3D12RootSignature> load_root_signature_;
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
+
+  // gpu_native_resolves: native_resolve_cs, created only with the cvar enabled.
+  // Root parameter 0 - NativeResolveConstants, 1 - source SRV table, 2 - destination UAV table.
+  struct NativeResolveConstants {
+    uint32_t mode;
+    float scale;
+    int32_t source_offset[2];
+    int32_t dest_offset[2];
+    uint32_t size[2];
+    uint32_t fill[2];
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> native_resolve_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> native_resolve_pipeline_;
+
+  // gpu_native_resolves: a texture just written by WriteNativeResolveToTextures, before it's
+  // marked up to date.
+  struct NativeResolveHookInfo {
+    // Guest physical address of the texture base.
+    uint32_t dest_address;
+    xenos::TextureFormat format;
+    // Of the whole texture, in host pixels (resolution-scaled).
+    uint32_t width;
+    uint32_t height;
+    int32_t exp_bias;
+  };
+  // Runs the enabled effects on the texture in place, leaving it in its current state.
+  void ApplyNativeResolveHooks(D3D12Texture& texture, const NativeResolveHookInfo& info,
+                               NativeResolveWriteCounts& counts);
+  // gpu_native_hook_example: native_hook_desaturate_cs, created only with the cvar enabled.
+  // Root parameter 0 - NativeHookDesaturateConstants, 1 - texture UAV table.
+  struct NativeHookDesaturateConstants {
+    uint32_t size[2];
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> native_hook_desaturate_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> native_hook_desaturate_pipeline_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;

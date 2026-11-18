@@ -34,6 +34,8 @@
 #include <SDL3/SDL_metal.h>
 
 #include <rex/ui/surface_mac.h>
+#elif REX_PLATFORM_ANDROID
+#include <rex/ui/surface_android.h>
 #else
 #include <X11/Xlib-xcb.h>
 #include <rex/ui/surface_gnulinux.h>
@@ -75,6 +77,41 @@ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
       return MouseEvent::Button::kNone;
   }
 }
+
+#if REX_PLATFORM_ANDROID
+TouchEvent::Action TranslateFingerAction(Uint32 type) {
+  switch (type) {
+    case SDL_EVENT_FINGER_DOWN:
+      return TouchEvent::Action::kDown;
+    case SDL_EVENT_FINGER_UP:
+      return TouchEvent::Action::kUp;
+    case SDL_EVENT_FINGER_CANCELED:
+      return TouchEvent::Action::kCancel;
+    case SDL_EVENT_FINGER_MOTION:
+    default:
+      return TouchEvent::Action::kMove;
+  }
+}
+
+bool IsSynthesizedMouseEvent(const SDL_Event& event) {
+  SDL_MouseID which = 0;
+  switch (event.type) {
+    case SDL_EVENT_MOUSE_MOTION:
+      which = event.motion.which;
+      break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+      which = event.button.which;
+      break;
+    case SDL_EVENT_MOUSE_WHEEL:
+      which = event.wheel.which;
+      break;
+    default:
+      return false;
+  }
+  return which == SDL_TOUCH_MOUSEID || which == SDL_PEN_MOUSEID;
+}
+#endif
 
 }  // namespace
 
@@ -447,6 +484,10 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
       SDL_Metal_DestroyView(metal_view);
     }
   }
+#elif REX_PLATFORM_ANDROID
+  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
+    return AndroidNativeWindowSurface::Create(sdl_window_);
+  }
 #else
   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {
@@ -533,9 +574,19 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
       OnPaint(true);
       break;
     case SDL_EVENT_WINDOW_MINIMIZED:
+#if REX_PLATFORM_ANDROID
+      // SDL minimizes the window when the app leaves the screen, which is when Android destroys
+      // the window's surface. SDL's event pump blocks while the app is away, so this usually
+      // runs on the way back: the surface's own reference keeps the old window valid until now.
+      OnSurfaceChanged(false);
+#endif
       OnMinimized(destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_RESTORED:
+#if REX_PLATFORM_ANDROID
+      // Back on screen: connect the presenter to the window Android made for the return.
+      OnSurfaceChanged(true);
+#endif
       OnRestored(destruction_receiver);
       break;
     case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
@@ -598,6 +649,12 @@ void WindowSDL::HandleTextInputEvent(SDL_Event& event) {
 }
 
 void WindowSDL::HandleMouseEvent(SDL_Event& event) {
+#if REX_PLATFORM_ANDROID
+  // SDL also reports fingers and pens as mouse events; they reach listeners as TouchEvent instead.
+  if (IsSynthesizedMouseEvent(event)) {
+    return;
+  }
+#endif
   // SDL3 reports float window coordinates; listeners expect physical pixels.
   float density = GetPixelDensity();
   WindowDestructionReceiver destruction_receiver(this);
@@ -636,5 +693,23 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
       break;
   }
 }
+
+#if REX_PLATFORM_ANDROID
+void WindowSDL::HandleTouchEvent(SDL_Event& event) {
+  if (event.tfinger.touchID == SDL_MOUSE_TOUCHID) {
+    return;
+  }
+  TouchEvent::Action action = TranslateFingerAction(event.tfinger.type);
+  uint32_t pointer_id = uint32_t(event.tfinger.fingerID);
+  if (pointer_id == TouchEvent::kPointerIDNone) {
+    pointer_id = TouchEvent::kPointerIDNone - 1;
+  }
+  float x = event.tfinger.x * float(GetActualPhysicalWidth());
+  float y = event.tfinger.y * float(GetActualPhysicalHeight());
+  WindowDestructionReceiver destruction_receiver(this);
+  TouchEvent e(this, pointer_id, action, x, y);
+  OnTouchEvent(e, destruction_receiver);
+}
+#endif
 
 }  // namespace rex::ui

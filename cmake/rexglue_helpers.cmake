@@ -46,11 +46,10 @@ endfunction()
 #==========================================================
 function(rexglue_apply_target_settings target_name)
     if(UNIX AND NOT APPLE)
-        # Large executable support
-        if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-            target_link_options(${target_name} PRIVATE -Wl,--no-relax)
-            target_compile_options(${target_name} PRIVATE -mcmodel=large)
-        elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64")
+        # No large code model on x86_64: the small model reaches ±2 GB of code (see CMakeLists.txt).
+        if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|ARM64" AND NOT ANDROID)
+            # Not on Android: its builds pass -march=armv8.2-a (LSE atomics) in the toolchain
+            # flags, and a later -march=armv8-a here would lower it again.
             target_compile_options(${target_name} PRIVATE -march=armv8-a)
         endif()
     endif()
@@ -109,10 +108,10 @@ function(rexglue_configure_target target_name)
             COMMAND_EXPAND_LISTS
             VERBATIM
         )
-    elseif(APPLE)
-        # macOS: $<TARGET_RUNTIME_DLLS> does not resolve imported dylibs, so
-        # stage the shared runtime libraries explicitly next to the executable
-        # (paired with the @executable_path rpath above). Everything else the
+    else()
+        # macOS and Linux: $<TARGET_RUNTIME_DLLS> is Windows-only, so stage the
+        # shared runtime libraries explicitly next to the executable (paired
+        # with the @executable_path / $ORIGIN rpath above). Everything else the
         # runtime links (fmt, spdlog, SDL3, ...) is static. Target names
         # differ between an in-tree build and an installed SDK import.
         foreach(_rexglue_runtime_lib rex::runtime rexruntime rex::TracyClient TracyClient)

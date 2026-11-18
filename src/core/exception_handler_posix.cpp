@@ -31,12 +31,23 @@
 
 #include <ucontext.h>
 
+#if REX_PLATFORM_ANDROID
+#include <dlfcn.h>
+
+#include <cstdio>
+#include <string>
+
+#include <fmt/format.h>
+
+#include <rex/thread.h>
+#endif
+
 namespace rex::arch {
 
 bool signal_handlers_installed_ = false;
 struct sigaction original_sigill_handler_;
 struct sigaction original_sigsegv_handler_;
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
 struct sigaction original_sigbus_handler_;
 #endif
 
@@ -48,6 +59,110 @@ constexpr size_t kMaxHandlerCount = 8;
 // All custom handlers, left-aligned and null terminated.
 // Executed in order.
 std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+
+#if REX_PLATFORM_ANDROID
+static const char* SignalName(int signal_number) {
+  switch (signal_number) {
+    case SIGSEGV:
+      return "SIGSEGV";
+    case SIGBUS:
+      return "SIGBUS";
+    case SIGILL:
+      return "SIGILL";
+    default:
+      break;
+  }
+  static char unknown_signal[32];
+  std::snprintf(unknown_signal, sizeof(unknown_signal), "signal %d", signal_number);
+  return unknown_signal;
+}
+
+static const char* SignalCodeName(int signal_number, int signal_code) {
+  if (signal_number == SIGSEGV) {
+    switch (signal_code) {
+      case SEGV_MAPERR:
+        return "SEGV_MAPERR";
+      case SEGV_ACCERR:
+        return "SEGV_ACCERR";
+      default:
+        return "?";
+    }
+  }
+  if (signal_number == SIGBUS) {
+    switch (signal_code) {
+      case BUS_ADRALN:
+        return "BUS_ADRALN";
+      case BUS_ADRERR:
+        return "BUS_ADRERR";
+      case BUS_OBJERR:
+        return "BUS_OBJERR";
+      default:
+        return "?";
+    }
+  }
+  if (signal_number == SIGILL) {
+    switch (signal_code) {
+      case ILL_ILLOPC:
+        return "ILL_ILLOPC";
+      case ILL_ILLOPN:
+        return "ILL_ILLOPN";
+      case ILL_ILLADR:
+        return "ILL_ILLADR";
+      case ILL_ILLTRP:
+        return "ILL_ILLTRP";
+      case ILL_PRVOPC:
+        return "ILL_PRVOPC";
+      case ILL_PRVREG:
+        return "ILL_PRVREG";
+#ifdef ILL_COPROC
+      case ILL_COPROC:
+        return "ILL_COPROC";
+#endif
+      case ILL_BADSTK:
+        return "ILL_BADSTK";
+      default:
+        return "?";
+    }
+  }
+  return "?";
+}
+
+static std::string DescribeHostAddress(uintptr_t address) {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<const void*>(address), &info) == 0 || !info.dli_fname) {
+    return fmt::format("0x{:016X}", address);
+  }
+  const char* slash = std::strrchr(info.dli_fname, '/');
+  const char* module = slash ? slash + 1 : info.dli_fname;
+  std::string result = fmt::format(
+      "{}+0x{:X}", module, address - reinterpret_cast<uintptr_t>(info.dli_fbase));
+  if (info.dli_sname) {
+    result += fmt::format(" ({}+0x{:X})", info.dli_sname,
+                          address - reinterpret_cast<uintptr_t>(info.dli_saddr));
+  }
+  return result;
+}
+
+static void LogUnclaimedFault(int signal_number, const siginfo_t* signal_info,
+                              const ucontext_t* signal_context, uint64_t esr) {
+  uintptr_t pc = 0;
+  uintptr_t lr = 0;
+#if REX_ARCH_ARM64
+  pc = static_cast<uintptr_t>(signal_context->uc_mcontext.pc);
+  lr = static_cast<uintptr_t>(signal_context->uc_mcontext.regs[30]);
+#else
+  (void)signal_context;
+#endif
+  const std::string esr_text =
+      esr != 0 ? fmt::format("0x{:08X}", static_cast<uint32_t>(esr)) : "none";
+  // dladdr is not async-signal-safe, but the process is about to die and this line is the only report a player can send.
+  REXLOG_ERROR("FAULT unclaimed {} code={}({}) addr=0x{:016X} pc={} lr={} esr={} thread=0x{:X}",
+               SignalName(signal_number), SignalCodeName(signal_number, signal_info->si_code),
+               signal_info->si_code, reinterpret_cast<uintptr_t>(signal_info->si_addr),
+               DescribeHostAddress(pc), DescribeHostAddress(lr), esr_text,
+               rex::thread::current_thread_id());
+}
+#endif  // REX_PLATFORM_ANDROID
 
 static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
                                      void* signal_context) {
@@ -170,10 +285,11 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
     case SIGBUS:
       // On macOS, SIGBUS (KERN_PROTECTION_FAILURE) is raised for writes to
       // read-protected pages — the same scenario that raises SIGSEGV on Linux.
+      // On Android (ARM64) protection faults may also arrive as SIGBUS.
       // Fall through to treat it as an access violation.
-#if !REX_PLATFORM_MAC
-      // On non-Mac POSIX, SIGBUS is a bus error (misaligned access), not a
-      // protection fault — don't handle it here.
+#if !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID
+      // On non-Mac, non-Android POSIX, SIGBUS is a bus error (misaligned
+      // access), not a protection fault — don't handle it here.
       assert_unhandled_case(signal_number);
       return;
 #endif
@@ -417,6 +533,46 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
       return;
     }
   }
+
+#if REX_PLATFORM_ANDROID
+  // No guest handler claimed the fault. Returning would resume the faulting
+  // instruction and fault again forever, so forward to the previously
+  // installed action instead.
+  {
+    uint64_t fault_esr = 0;
+#if REX_ARCH_ARM64
+    if (mcontext_esr) {
+      fault_esr = mcontext_esr->esr;
+    }
+#endif
+    LogUnclaimedFault(signal_number, signal_info,
+                      reinterpret_cast<const ucontext_t*>(signal_context), fault_esr);
+  }
+  const struct sigaction* previous = nullptr;
+  if (signal_number == SIGSEGV) {
+    previous = &original_sigsegv_handler_;
+  } else if (signal_number == SIGBUS) {
+    previous = &original_sigbus_handler_;
+  } else if (signal_number == SIGILL) {
+    previous = &original_sigill_handler_;
+  }
+  if (previous) {
+    if ((previous->sa_flags & SA_SIGINFO) != 0 && previous->sa_sigaction != nullptr) {
+      previous->sa_sigaction(signal_number, signal_info, signal_context);
+      return;
+    }
+    if (previous->sa_handler != SIG_DFL && previous->sa_handler != SIG_IGN &&
+        previous->sa_handler != nullptr) {
+      previous->sa_handler(signal_number);
+      return;
+    }
+  }
+  // No previous handler (or it was default/ignore): restore the default
+  // disposition and re-raise so the process dies with the original signal
+  // instead of spinning on the fault.
+  signal(signal_number, SIG_DFL);
+  raise(signal_number);
+#endif
 }
 
 void ExceptionHandler::Install(Handler fn, void* data) {
@@ -433,7 +589,7 @@ void ExceptionHandler::Install(Handler fn, void* data) {
     if (sigaction(SIGSEGV, &signal_handler, &original_sigsegv_handler_) != 0) {
       assert_always("Failed to install new SIGSEGV handler");
     }
-#if REX_PLATFORM_MAC
+#if REX_PLATFORM_MAC || REX_PLATFORM_ANDROID
     if (sigaction(SIGBUS, &signal_handler, &original_sigbus_handler_) != 0) {
       assert_always("Failed to install new SIGBUS handler");
     }

@@ -15,6 +15,7 @@
 #include <memory>
 #include <vector>
 
+#include <rex/platform.h>
 #include <rex/thread.h>
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/window_listener.h>
@@ -38,6 +39,13 @@ class ImGuiDialog {
   void Then(rex::thread::Fence* fence);
 
   void Draw();
+
+#if REX_PLATFORM_ANDROID
+  // False for a passive overlay (on-screen controls) that can wait for the next guest frame: while
+  // only such dialogs are open, the drawer stops repainting at the display's refresh rate, which
+  // costs a phone GPU a full extra present every refresh.
+  virtual bool WantsContinuousPaint() const { return true; }
+#endif
 
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);

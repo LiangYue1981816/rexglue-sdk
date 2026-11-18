@@ -226,6 +226,9 @@ class Presenter {
       // inputs in the presenter path.
       kFsr3,
 #endif
+#if REX_PLATFORM_ANDROID
+      kSgsr1,
+#endif
     };
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
@@ -329,6 +332,9 @@ class Presenter {
 
   virtual Surface::TypeFlags GetSupportedSurfaceTypes() const = 0;
 
+  // The window the presenter is attached to, null if none. UI thread only.
+  Window* window() const { return window_; }
+
   // For calling from the Window for the Presenter attached to it.
   // May be called from the destructor of the presenter through the window.
   void SetWindowSurfaceFromUIThread(Window* new_window, Surface* new_surface);
@@ -362,6 +368,8 @@ class Presenter {
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
   virtual bool CaptureGuestOutput(RawImage& image_out) = 0;
+
+  virtual void RequestScreenshot() {}
   const GuestOutputPaintConfig& GetGuestOutputPaintConfigFromUIThread() const {
     return guest_output_paint_config_;
   }
@@ -436,6 +444,9 @@ class Presenter {
     kFsrRcas,
     kFsrRcasDither,
 #endif
+#if REX_PLATFORM_ANDROID
+    kSgsr1,
+#endif
 
     kCount,
   };
@@ -450,6 +461,10 @@ class Presenter {
       case GuestOutputPaintEffect::kCasSharpenDither:
       case GuestOutputPaintEffect::kCasResampleDither:
       case GuestOutputPaintEffect::kFsrRcasDither:
+#endif
+#if REX_PLATFORM_ANDROID
+      // SGSR 1 always draws the final pass, into the swapchain.
+      case GuestOutputPaintEffect::kSgsr1:
 #endif
         return false;
       default:
@@ -469,6 +484,46 @@ class Presenter {
         return true;
     };
   }
+
+#if REX_PLATFORM_ANDROID
+  // Whether GetGuestOutputPaintFlow may use `effect` when `configured` is selected; every flow
+  // may end with a bilinear stretch.
+  static constexpr bool IsGuestOutputPaintEffectUsedBy(GuestOutputPaintConfig::Effect configured,
+                                                       GuestOutputPaintEffect effect) {
+    switch (effect) {
+      case GuestOutputPaintEffect::kBilinear:
+      case GuestOutputPaintEffect::kBilinearDither:
+        return true;
+#if defined(REX_HAS_FIDELITYFX_SDK)
+      case GuestOutputPaintEffect::kCasSharpen:
+      case GuestOutputPaintEffect::kCasSharpenDither:
+      case GuestOutputPaintEffect::kCasResample:
+      case GuestOutputPaintEffect::kCasResampleDither:
+        // FSR sharpens with CAS when it does not upscale.
+        return configured == GuestOutputPaintConfig::Effect::kCas || IsFsrConfigured(configured);
+      case GuestOutputPaintEffect::kFsrEasu:
+      case GuestOutputPaintEffect::kFsrRcas:
+      case GuestOutputPaintEffect::kFsrRcasDither:
+        return IsFsrConfigured(configured);
+#endif
+      case GuestOutputPaintEffect::kSgsr1:
+        return configured == GuestOutputPaintConfig::Effect::kSgsr1;
+      default:
+        return false;
+    }
+  }
+
+#if defined(REX_HAS_FIDELITYFX_SDK)
+  static constexpr bool IsFsrConfigured(GuestOutputPaintConfig::Effect configured) {
+    return configured == GuestOutputPaintConfig::Effect::kFsr ||
+           configured == GuestOutputPaintConfig::Effect::kFsr2 ||
+           configured == GuestOutputPaintConfig::Effect::kFsr3;
+  }
+#endif
+
+  // present_effect as parsed at launch (it needs a restart to change).
+  static GuestOutputPaintConfig::Effect GetConfiguredGuestOutputPaintEffect();
+#endif
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
   // The longest path is kFsrMaxUpscalingPassesMax + optionally RCAS +
@@ -547,6 +602,29 @@ class Presenter {
       output_size_inv[1] = 1.0f / float(output_size.second);
     }
   };
+
+#if REX_PLATFORM_ANDROID
+  struct Sgsr1Constants {
+    int32_t output_offset[2];
+    float output_size_inv[2];
+    // Snapdragon GSR's ViewportInfo[0]: 1 / input size, input size.
+    float viewport_info[4];
+
+    void Initialize(const GuestOutputPaintFlow& flow, size_t effect_index) {
+      flow.GetEffectOutputOffset(effect_index, output_offset[0], output_offset[1]);
+      const std::pair<uint32_t, uint32_t>& output_size = flow.effect_output_sizes[effect_index];
+      output_size_inv[0] = 1.0f / float(output_size.first);
+      output_size_inv[1] = 1.0f / float(output_size.second);
+      uint32_t input_width, input_height;
+      flow.GetEffectInputSize(effect_index, input_width, input_height);
+      viewport_info[0] = 1.0f / float(input_width);
+      viewport_info[1] = 1.0f / float(input_height);
+      viewport_info[2] = float(input_width);
+      viewport_info[3] = float(input_height);
+    }
+  };
+  static_assert(sizeof(Sgsr1Constants) == 32);
+#endif
 
 #if defined(REX_HAS_FIDELITYFX_SDK)
   static constexpr float CalculateCasPostSetupSharpness(float sharpness) {

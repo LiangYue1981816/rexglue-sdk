@@ -27,10 +27,13 @@ class D3D12GraphicsSystem : public GraphicsSystem {
   static bool IsAvailable();
 
   std::string name() const override;
+  X_STATUS SetupPresentation(::rex::ui::WindowedAppContext* app_context) override;
+  void Shutdown() override;
 
  protected:
   void CreateProvider(bool with_presentation) override;
   std::unique_ptr<CommandProcessor> CreateCommandProcessor() override;
+
 };
 
 }  // namespace rex::graphics::d3d12

@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "performance_stats.h"
+
 #include <algorithm>
 #include <cstdarg>
 #include <cstring>
@@ -20,6 +22,10 @@
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/graphics/d3d12/gow2_temporal.h>
+#include <rex/graphics/d3d12/gow2_framegen.h>
+#include <rex/graphics/d3d12/gow2_trace.h>
+#include <cstdlib>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -31,6 +37,10 @@
 #include <rex/memory/utils.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+
+REXCVAR_DEFINE_BOOL(d3d12_stats_log, false, "GPU/D3D12",
+                    "Log D3D12 performance counters every five seconds")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -47,7 +57,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, gpu_vertex_buffer_state_skip);
+
 namespace rex::graphics::d3d12 {
+
+namespace {
+
+void ConfigureFrameGeneration(ID3D12GraphicsCommandList*, void* user) {
+  uint64_t frame_id = uint64_t(reinterpret_cast<uintptr_t>(user));
+  gow2::GetFrameGeneration().ConfigureFrame(frame_id);
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -148,6 +169,13 @@ void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path&
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
+}
+
+void D3D12CommandProcessor::InitializeTextureReplacement(const std::filesystem::path& cache_root,
+                                                         uint32_t title_id) {
+  if (texture_cache_) {
+    texture_cache_->InitializeTextureReplacement(cache_root, title_id);
+  }
 }
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
@@ -647,17 +675,20 @@ D3D12CommandProcessor::GetSharedMemoryUintPow2BindlessUAVHandlePair(
 
 ui::d3d12::util::DescriptorCpuGpuHandlePair
 D3D12CommandProcessor::GetEdramUintPow2BindlessSRVHandlePair(
-    uint32_t element_size_bytes_pow2) const {
+    uint32_t element_size_bytes_pow2, bool second_half) const {
   SystemBindlessView view;
   switch (element_size_bytes_pow2) {
     case 2:
-      view = SystemBindlessView::kEdramR32UintSRV;
+      view = second_half ? SystemBindlessView::kEdramR32UintSRVSecondHalf
+                         : SystemBindlessView::kEdramR32UintSRV;
       break;
     case 3:
-      view = SystemBindlessView::kEdramR32G32UintSRV;
+      view = second_half ? SystemBindlessView::kEdramR32G32UintSRVSecondHalf
+                         : SystemBindlessView::kEdramR32G32UintSRV;
       break;
     case 4:
-      view = SystemBindlessView::kEdramR32G32B32A32UintSRV;
+      view = second_half ? SystemBindlessView::kEdramR32G32B32A32UintSRVSecondHalf
+                         : SystemBindlessView::kEdramR32G32B32A32UintSRV;
       break;
     default:
       assert_unhandled_case(element_size_bytes_pow2);
@@ -1608,6 +1639,27 @@ bool D3D12CommandProcessor::SetupContext() {
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kEdramR32G32B32A32UintUAV)),
         4);
+    // kEdramRawSRVSecondHalf.
+    render_target_cache_->WriteEdramRawSRVDescriptor(
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kEdramRawSRVSecondHalf)),
+        true);
+    // kEdramR32UintSRVSecondHalf.
+    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kEdramR32UintSRVSecondHalf)),
+        2, true);
+    // kEdramR32G32UintSRVSecondHalf.
+    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kEdramR32G32UintSRVSecondHalf)),
+        3, true);
+    // kEdramR32G32B32A32UintSRVSecondHalf.
+    render_target_cache_->WriteEdramUintPow2SRVDescriptor(
+        provider.OffsetViewDescriptor(
+            view_bindless_heap_cpu_start_,
+            uint32_t(SystemBindlessView::kEdramR32G32B32A32UintSRVSecondHalf)),
+        4, true);
     // kGammaRampTableSRV.
     WriteGammaRampSRV(
         false, provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
@@ -1894,8 +1946,18 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  stats::OnSwap();
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
+#ifdef GOW2_DEV_TOOLS
+  if (Gow2TraceBeginFrame()) {
+    REXGPU_WARN("SWAP f={} front={:08X} {}x{} remaining={}", gow2_trace_frame.load(),
+                frontbuffer_ptr, frontbuffer_width, frontbuffer_height,
+                gow2_trace_remaining.load());
+    Gow2TraceEndFrame();
+  }
+#endif
+  gow2::BeginFrame(*this, frontbuffer_ptr);
 
   if (!graphics_system_)
     return;
@@ -1977,6 +2039,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           "unscaled ({}x{}). This title may be presenting from an unscaled "
           "resolve path.",
           guest_output_width, guest_output_height);
+    }
+  }
+
+  // DLSS / FSR: the finished guest frame is upscaled to the screen size and shown instead of it.
+  {
+    gow2::FinalImage upscaled;
+    if (gow2::UpscaleFinal(*this, swap_texture_resource, guest_output_width, guest_output_height,
+                           upscaled)) {
+      swap_texture_resource = upscaled.resource;
+      swap_texture_srv_desc.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+      guest_output_width = upscaled.w;
+      guest_output_height = upscaled.h;
     }
   }
 
@@ -2246,6 +2320,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue.
+        gow2::CaptureOutputIfRequested(*this, guest_output_resource,
+                                       ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
         SubmitBarriers();
         EndSubmission(true);
         return true;
@@ -2327,6 +2403,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
 
+  if (pixel_shader) {
+    gow2::NoteSceneDraw(
+        reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]),
+        uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format), index_count);
+  }
+#ifdef GOW2_DEV_TOOLS
+  if (Gow2TraceActive() && pixel_shader) {
+    // One line per draw: shaders, primitive, targets and the textures the pixel shader samples.
+    uint32_t color0 = regs.Get<reg::RB_COLOR_INFO>().color_base;
+    uint32_t color_fmt = uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format);
+    uint32_t depth_base = regs.Get<reg::RB_DEPTH_INFO>().depth_base;
+    std::string tex;
+    uint32_t used = 0;
+    for (const auto& b : pixel_shader->texture_bindings()) used |= (1u << b.fetch_constant);
+    for (uint32_t i = 0; i < 32; ++i) {
+      if (!(used & (1u << i))) continue;
+      xenos::xe_gpu_texture_fetch_t tf = regs.GetTextureFetch(i);
+      tex += fmt::format(" tf{}={:08X}/{}x{}/f{}", i, uint32_t(tf.base_address) << 12,
+                         uint32_t(tf.size_2d.width) + 1, uint32_t(tf.size_2d.height) + 1,
+                         uint32_t(tf.format));
+    }
+    int vp_at = gow2::FindCameraMatrix(
+        reinterpret_cast<const float*>(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]));
+    REXGPU_WARN(
+        "DRAW f={} vs={:016X} ps={:016X} prim={} n={} rt0={:X}/f{} z={:X} edram_mode={} pitch={} "
+        "vp@{}{}",
+        gow2_trace_frame.load(), vertex_shader->ucode_data_hash(), pixel_shader->ucode_data_hash(),
+        uint32_t(primitive_type), index_count, color0, color_fmt, depth_base, uint32_t(edram_mode),
+        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), vp_at, tex);
+  }
+#endif
+
   if (!BeginSubmission(true)) {
     return false;
   }
@@ -2400,6 +2508,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
+    stats::Record(stats::Counter::kDrawsPipelinePending);
     return true;
   }
 
@@ -2408,6 +2517,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  gow2::OnDrawTextures(*this, *texture_cache_, regs, used_texture_mask);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2462,12 +2572,36 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
 
+  // Temporal jitter: shifts the NDC offset of world-geometry draws in the scene surface only
+  // (the fixed-function viewport is unchanged).
+  draw_util::ViewportInfo ndc_viewport_info = viewport_info;
+  if (gow2::ShouldJitter(vertex_shader->constant_register_map().float_bitmap,
+                         regs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+                         uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format))) {
+    const uint32_t host_w = gow2::State().guest_w * draw_resolution_scale_x;
+    const uint32_t host_h = gow2::State().guest_h * draw_resolution_scale_y;
+    float j[2];
+    gow2::JitterNdc(host_w, host_h, j);
+    float fx, fy;
+    uint32_t rw, rh;
+    if (gow2::RenderScale(host_w, host_h, &fx, &fy, &rw, &rh)) {
+      // Rasterise into the top-left (fx*W, fy*H) region; the upscaler reconstructs the rest.
+      ndc_viewport_info.ndc_scale[0] *= fx;
+      ndc_viewport_info.ndc_scale[1] *= fy;
+      ndc_viewport_info.ndc_offset[0] = ndc_viewport_info.ndc_offset[0] * fx + (fx - 1.0f);
+      ndc_viewport_info.ndc_offset[1] = ndc_viewport_info.ndc_offset[1] * fy + (1.0f - fy);
+    }
+    ndc_viewport_info.ndc_offset[0] += j[0];
+    ndc_viewport_info.ndc_offset[1] += j[1];
+  }
+
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
-                             primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+                             primitive_processing_result.host_shader_index_endian,
+                             ndc_viewport_info, used_texture_mask, normalized_depth_control,
+                             normalized_color_mask);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -2507,7 +2641,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           return false;
       }
       VertexBufferState& state = vertex_buffer_states_[vfetch_index];
-      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+      // The in-sync bit is cleared at every swap so each buffer is requested again in a new frame
+      // (the CPU may have rewritten it in place). Skipping the request because the address and size
+      // are unchanged defeated that: the first draw of a frame then used the previous frame's data.
+      // Reported by Flippage (issue #20); Xenia requests every vertex buffer of every draw.
+      if (REXCVAR_GET(gpu_vertex_buffer_state_skip) && state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
         vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
         continue;
       }
@@ -2628,6 +2766,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    stats::Record(stats::Counter::kDraws);
     deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
                                             0, 0);
   } else {
@@ -2687,6 +2826,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
+    stats::Record(stats::Counter::kDraws);
     deferred_command_list_.D3DDrawIndexedInstanced(
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
     if (scratch_index_buffer != nullptr) {
@@ -2711,8 +2851,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // be unknown. Keep invalidation conservative in this case.
       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
     }
-    if (IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport)) &&
-        !memexport_ranges_.empty()) {
+    // memexport_ranges_ first: IsReadbackMemexportEnabled looks a cvar up by name (registry lock,
+    // string allocation), and this runs on every draw.
+    if (!memexport_ranges_.empty() &&
+        IsReadbackMemexportEnabled(REXCVAR_GET(d3d12_readback_memexport))) {
       uint32_t memexport_total_size = 0;
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
@@ -2735,6 +2877,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
     return true;
   }
 
+  stats::Record(stats::Counter::kMemexportFull);
   ID3D12Resource* readback_buffer = RequestReadbackBuffer(total_size);
   if (!readback_buffer) {
     return true;
@@ -2751,7 +2894,8 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFullPath(uint32_t total_s
     readback_buffer_offset += memexport_range.size_bytes;
   }
 
-  if (!AwaitAllQueueOperationsCompletion()) {
+  if (!stats::MeasureWait(stats::Counter::kMemexportWaitUs,
+                          [&] { return AwaitAllQueueOperationsCompletion(); })) {
     return true;
   }
 
@@ -2780,6 +2924,7 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     return true;
   }
 
+  stats::Record(stats::Counter::kMemexportFast);
   const uint64_t readback_key =
       MakeMemexportReadbackKey(memexport_ranges_.front().base_address_dwords, total_size);
   ReadbackBuffer& readback = memexport_readback_buffers_[readback_key];
@@ -2809,7 +2954,8 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
     }
 
     if (readback.buffers[index]) {
-      if (!AwaitAllQueueOperationsCompletion()) {
+      if (!stats::MeasureWait(stats::Counter::kMemexportWaitUs,
+                              [&] { return AwaitAllQueueOperationsCompletion(); })) {
         buffer->Unmap(0, nullptr);
         buffer->Release();
         return false;
@@ -3118,7 +3264,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
                     SUCCEEDED(queue_operations_since_submission_fence_->SetEventOnCompletion(
                         fence_value, fence_completion_event_)))) {
         PROFILE_CMD_BUFFER_STALL();
-        WaitForSingleObject(fence_completion_event_, INFINITE);
+        stats::MeasureWait(stats::Counter::kQueueWaitUs,
+                           [&] { return WaitForSingleObject(fence_completion_event_, INFINITE); });
         queue_operations_done_since_submission_signal_ = false;
       } else {
         REXGPU_ERROR(
@@ -3137,7 +3284,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
-      WaitForSingleObject(fence_completion_event_, INFINITE);
+      stats::MeasureWait(stats::Counter::kQueueWaitUs,
+                         [&] { return WaitForSingleObject(fence_completion_event_, INFINITE); });
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3414,6 +3562,14 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // destroyed between frames.
     SubmitBarriers();
 
+    if (is_closing_frame) {
+      if (gow2::GetFrameGeneration().enabled()) {
+        uint64_t frame_id = GetCurrentFrame();
+        deferred_command_list_.Callback(&ConfigureFrameGeneration,
+                                        reinterpret_cast<void*>(uintptr_t(frame_id)));
+      }
+    }
+
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
     // Submit the deferred command list.
@@ -3449,6 +3605,10 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Queue operations done directly (like UpdateTileMappings) will be awaited
     // alongside the last submission if needed.
     queue_operations_done_since_submission_signal_ = false;
+  } else if (is_closing_frame) {
+    if (gow2::GetFrameGeneration().enabled()) {
+      gow2::GetFrameGeneration().ConfigureFrame(GetCurrentFrame());
+    }
   }
 
   if (is_closing_frame) {
@@ -3640,7 +3800,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       normalized_depth_control.stencil_enable || normalized_depth_control.z_enable;
   if (edram_rov_used && depth_stencil_enabled) {
     for (uint32_t i = 0; i < 4; ++i) {
-      if (rb_depth_info.depth_base == color_infos[i].color_base &&
+      if (rb_depth_info.depth_base + (rb_depth_info.depth_base_bit_11 << xenos::kEdramBaseTilesBits) ==
+              color_infos[i].color_base + (color_infos[i].color_base_bit_11 << xenos::kEdramBaseTilesBits) &&
           (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX)) {
         depth_stencil_enabled = false;
         break;
@@ -3894,7 +4055,10 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
       dirty |= system_constants_.edram_rt_keep_mask[i][1] != rt_keep_masks[i][1];
       system_constants_.edram_rt_keep_mask[i][1] = rt_keep_masks[i][1];
       if (rt_keep_masks[i][0] != UINT32_MAX || rt_keep_masks[i][1] != UINT32_MAX) {
-        uint32_t rt_base_dwords_scaled = color_info.color_base * edram_tile_dwords_scaled;
+        // Bit 11 of the base selects the second 2048 tiles of the virtual EDRAM (kEdramVirtualTileCount).
+        uint32_t rt_base_dwords_scaled =
+            (color_info.color_base + (color_info.color_base_bit_11 << xenos::kEdramBaseTilesBits)) *
+            edram_tile_dwords_scaled;
         dirty |= system_constants_.edram_rt_base_dwords_scaled[i] != rt_base_dwords_scaled;
         system_constants_.edram_rt_base_dwords_scaled[i] = rt_base_dwords_scaled;
         uint32_t format_flags = RenderTargetCache::AddPSIColorFormatFlags(color_info.color_format);
@@ -3914,7 +4078,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   if (edram_rov_used) {
-    uint32_t depth_base_dwords_scaled = rb_depth_info.depth_base * edram_tile_dwords_scaled;
+    uint32_t depth_base_dwords_scaled =
+        (rb_depth_info.depth_base + (rb_depth_info.depth_base_bit_11 << xenos::kEdramBaseTilesBits)) *
+        edram_tile_dwords_scaled;
     dirty |= system_constants_.edram_depth_base_dwords_scaled != depth_base_dwords_scaled;
     system_constants_.edram_depth_base_dwords_scaled = depth_base_dwords_scaled;
 

@@ -237,6 +237,9 @@ class VulkanPresenter final : public Presenter {
     kGuestOutputPaintPipelineLayoutIndexFsrRcas,
 #endif
 
+#if REX_PLATFORM_ANDROID
+    kGuestOutputPaintPipelineLayoutIndexSgsr1,
+#endif
     kGuestOutputPaintPipelineLayoutCount,
   };
 
@@ -258,6 +261,10 @@ class VulkanPresenter final : public Presenter {
       case GuestOutputPaintEffect::kFsrRcas:
       case GuestOutputPaintEffect::kFsrRcasDither:
         return kGuestOutputPaintPipelineLayoutIndexFsrRcas;
+#endif
+#if REX_PLATFORM_ANDROID
+      case GuestOutputPaintEffect::kSgsr1:
+        return kGuestOutputPaintPipelineLayoutIndexSgsr1;
 #endif
       default:
         assert_unhandled_case(effect);
@@ -281,7 +288,6 @@ class VulkanPresenter final : public Presenter {
       ~Submission();
 
       VkSemaphore acquire_semaphore() const { return acquire_semaphore_; }
-      VkSemaphore present_semaphore() const { return present_semaphore_; }
       VkCommandPool draw_command_pool() const { return draw_command_pool_; }
       VkCommandBuffer draw_command_buffer() const { return draw_command_buffer_; }
 
@@ -292,7 +298,6 @@ class VulkanPresenter final : public Presenter {
 
       const VulkanDevice* vulkan_device_;
       VkSemaphore acquire_semaphore_ = VK_NULL_HANDLE;
-      VkSemaphore present_semaphore_ = VK_NULL_HANDLE;
       VkCommandPool draw_command_pool_ = VK_NULL_HANDLE;
       VkCommandBuffer draw_command_buffer_ = VK_NULL_HANDLE;
     };
@@ -359,6 +364,9 @@ class VulkanPresenter final : public Presenter {
     // the original swapchain object, if it existed, for use as oldSwapchain if
     // needed and for destruction.
     VkSwapchainKHR PrepareForSwapchainRetirement();
+    // Destroys a swapchain returned by PrepareForSwapchainRetirement (if not null), then the
+    // present semaphores of the retired swapchains, which its presents may have waited on.
+    void DestroyRetiredSwapchain(VkSwapchainKHR old_swapchain);
     // May be called from the destructor of the presenter.
     void DestroySwapchainAndVulkanSurface();
 
@@ -416,6 +424,11 @@ class VulkanPresenter final : public Presenter {
     bool swapchain_is_fifo = false;
     std::vector<VkImage> swapchain_images;
     std::vector<SwapchainFramebuffer> swapchain_framebuffers;
+    // Signaled by the paint submission, awaited by the present of the same swapchain image. One
+    // per image: an image's semaphore is reused only once the image is acquired again, while a
+    // per-submission semaphore could be signaled while a present of another image still held it.
+    std::vector<VkSemaphore> swapchain_present_semaphores;
+    std::vector<VkSemaphore> retired_present_semaphores;
   };
 
   explicit VulkanPresenter(HostGpuLossCallback host_gpu_loss_callback,
@@ -434,6 +447,12 @@ class VulkanPresenter final : public Presenter {
 
   [[nodiscard]] VkPipeline CreateGuestOutputPaintPipeline(GuestOutputPaintEffect effect,
                                                           VkRenderPass render_pass);
+#if REX_PLATFORM_ANDROID
+  // True when every pipeline of the flow exists (creating the final pass's swapchain pipeline if
+  // needed); an effect that failed once stays unavailable.
+  bool PrepareGuestOutputPaintFlowPipelines(const GuestOutputPaintFlow& flow);
+  void MarkGuestOutputPaintEffectUnavailable(GuestOutputPaintEffect effect, const char* what);
+#endif
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   bool EnsureTemporalUpscalerContext(uint32_t render_width, uint32_t render_height,
@@ -456,6 +475,12 @@ class VulkanPresenter final : public Presenter {
       guest_output_paint_pipeline_layouts_ = {};
   VkShaderModule guest_output_paint_vs_ = VK_NULL_HANDLE;
   std::array<VkShaderModule, size_t(GuestOutputPaintEffect::kCount)> guest_output_paint_fs_ = {};
+#if REX_PLATFORM_ANDROID
+  // Effects whose shader module or a pipeline failed on this GPU; painting falls back to bilinear.
+  std::array<bool, size_t(GuestOutputPaintEffect::kCount)> guest_output_paint_effect_unavailable_ =
+      {};
+  bool guest_output_paint_fallback_logged_ = false;
+#endif
   // Not compatible with the swapchain render pass even if the format is the
   // same due to different dependencies (this is shader read > color
   // attachment > shader read).

@@ -36,8 +36,9 @@
 #include <rex/string.h>
 
 // macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
-// explicit *64 forms for legacy 32-bit off_t distributions.
-#if defined(__APPLE__)
+// explicit *64 forms for legacy 32-bit off_t distributions. Bionic (Android)
+// also uses 64-bit off_t and provides no *64 variants.
+#if defined(__APPLE__) || defined(__ANDROID__)
 #define rex_mmap64 mmap
 #define rex_ftruncate64 ftruncate
 #else
@@ -46,15 +47,11 @@
 #endif
 
 #if REX_PLATFORM_ANDROID
-#include <string.h>
+#include <sys/syscall.h>
 
-#include <dlfcn.h>
-#include <sys/ioctl.h>
+#include <android/sharedmem.h>
 
-#include <linux/ashmem.h>
-
-// TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#include <rex/main_android.h>
 #endif
 
 namespace rex {
@@ -85,30 +82,35 @@ static std::string MakeShmName(const std::filesystem::path& path) {
 }
 
 #if REX_PLATFORM_ANDROID
-// May be null if no dynamically loaded functions are required.
-static void* libandroid_;
-// API 26+.
-static int (*android_ASharedMemory_create_)(const char* name, size_t size);
+// Retained for the declared rex::memory::AndroidInitialize()/AndroidShutdown()
+// API; no dynamic setup is needed. ASharedMemory_create() is linked directly
+// from libandroid (always present: the port targets API 29+, and the API has
+// existed since level 26).
+void AndroidInitialize() {}
 
-void AndroidInitialize() {
-  if (rex::GetAndroidApiLevel() >= 26) {
-    libandroid_ = dlopen("libandroid.so", RTLD_NOW);
-    assert_not_null(libandroid_);
-    if (libandroid_) {
-      android_ASharedMemory_create_ = reinterpret_cast<decltype(android_ASharedMemory_create_)>(
-          dlsym(libandroid_, "ASharedMemory_create"));
-      assert_not_null(android_ASharedMemory_create_);
-    }
-  }
+void AndroidShutdown() {}
+
+// memfd_create() fallback for ASharedMemory_create() failures. Bionic only
+// declares memfd_create() in <sys/mman.h> for API 30+, so go through the
+// syscall directly to keep building against API 29.
+namespace {
+
+#ifndef MFD_CLOEXEC
+#define REX_MFD_CLOEXEC 0x0001U
+#else
+#define REX_MFD_CLOEXEC MFD_CLOEXEC
+#endif
+
+int CreateMemfd(const char* name) {
+#if defined(SYS_memfd_create)
+  return static_cast<int>(syscall(SYS_memfd_create, name, REX_MFD_CLOEXEC));
+#else
+  (void)name;
+  return -1;
+#endif
 }
 
-void AndroidShutdown() {
-  android_ASharedMemory_create_ = nullptr;
-  if (libandroid_) {
-    dlclose(libandroid_);
-    libandroid_ = nullptr;
-  }
-}
+}  // namespace
 #endif
 
 size_t page_size() {
@@ -295,6 +297,15 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 #endif
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
+#if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
+  // Kernels before 4.17 ignore MAP_FIXED_NOREPLACE and place the mapping elsewhere instead of
+  // failing with EEXIST, so a commit on a reservation would silently land at another address.
+  if (result != MAP_FAILED && base_address && result != base_address) {
+    munmap(result, length);
+    result = MAP_FAILED;
+    errno = EEXIST;
+  }
+#endif
   if (result != MAP_FAILED) {
     return result;
   }
@@ -432,28 +443,26 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
                                           PageAccess access, bool commit) {
 #if REX_PLATFORM_ANDROID
-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
-  if (android_ASharedMemory_create_) {
-    int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
-    return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
-                             : kFileMappingHandleInvalid;
+  // Shared guest memory must not use /dev/ashmem: apps targeting API 29+ are
+  // not allowed to open it. ASharedMemory (API 26+) is the primary path; both
+  // it and the memfd_create() fallback produce regions that can be mapped
+  // with execute permission, which guest code requires.
+  if (rex::GetAndroidApiLevel() >= 26) {
+    const int sharedmem_fd = ASharedMemory_create(path.c_str(), length);
+    if (sharedmem_fd >= 0) {
+      return static_cast<FileMappingHandle>(sharedmem_fd);
+    }
   }
 
-  // Use /dev/ashmem on API versions below 26, which added ASharedMemory.
-  // /dev/ashmem was disabled on API 29 for apps targeting it.
-  // https://chromium.googlesource.com/chromium/src/+/master/third_party/ashmem/ashmem-dev.c
-  int ashmem_fd = open("/" ASHMEM_NAME_DEF, O_RDWR);
-  if (ashmem_fd < 0) {
+  const int memfd = CreateMemfd(path.c_str());
+  if (memfd < 0) {
     return kFileMappingHandleInvalid;
   }
-  char ashmem_name[ASHMEM_NAME_LEN];
-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
-    close(ashmem_fd);
+  if (ftruncate(memfd, static_cast<off_t>(length)) != 0) {
+    close(memfd);
     return kFileMappingHandleInvalid;
   }
-  return static_cast<FileMappingHandle>(ashmem_fd);
+  return static_cast<FileMappingHandle>(memfd);
 #else
   int oflag;
   switch (access) {
@@ -478,9 +487,11 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
+  // Drop the name at once: the fd keeps the object alive, and a crash or SIGKILL can no longer
+  // leave the touched guest memory pinned in /dev/shm until reboot.
+  shm_unlink(full_path.c_str());
   if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
     close(ret);
-    shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
   return static_cast<FileMappingHandle>(ret);
@@ -488,11 +499,8 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
+  (void)path;
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
-  auto full_path = MakeShmName(path);
-  shm_unlink(full_path.c_str());
-#endif
 }
 
 void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, PageAccess access,

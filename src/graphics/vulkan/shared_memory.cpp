@@ -22,12 +22,45 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
+#include "pass_timing.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::vulkan {
+
+namespace {
+
+// The player's explicit choice always wins. Otherwise sparse binding is off
+// by default on Mesa Turnip, where vkQueueBindSparse fails on some Adreno
+// GPUs even though the driver advertises sparse binding.
+bool UseSparseSharedMemory(bool cvar_value, bool cvar_set_by_player, VkDriverId driver_id) {
+  if (cvar_set_by_player) {
+    return cvar_value;
+  }
+  if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+    return false;
+  }
+  return cvar_value;
+}
+
+}  // namespace
+
+#if REX_PLATFORM_ANDROID
+namespace {
+
+uint64_t UploadedBytes(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges,
+                       uint32_t page_size_log2) {
+  uint64_t pages = 0;
+  for (const auto& range : upload_page_ranges) {
+    pages += range.second;
+  }
+  return pages << page_size_log2;
+}
+
+}  // namespace
+#endif
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
                                        memory::Memory& memory,
@@ -61,8 +94,20 @@ bool VulkanSharedMemory::Initialize() {
   buffer_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
-  if (REXCVAR_GET(vulkan_sparse_shared_memory) &&
-      vulkan_device->properties().sparseResidencyBuffer) {
+  const bool sparse_shared_memory_cvar = REXCVAR_GET(vulkan_sparse_shared_memory);
+  const bool sparse_shared_memory_set_by_player =
+      rex::cvar::GetFlagSource("vulkan_sparse_shared_memory") != rex::cvar::Source::kDefault;
+  const VkDriverId driver_id = vulkan_device->properties().driverID;
+  const bool use_sparse_shared_memory =
+      UseSparseSharedMemory(sparse_shared_memory_cvar, sparse_shared_memory_set_by_player,
+                            driver_id);
+  if (!use_sparse_shared_memory && sparse_shared_memory_cvar &&
+      !sparse_shared_memory_set_by_player && driver_id == VK_DRIVER_ID_MESA_TURNIP) {
+    REXGPU_INFO(
+        "Vulkan sparse binding is not used on Mesa Turnip (its sparse binds fail on some Adreno "
+        "GPUs); set vulkan_sparse_shared_memory = true to force it");
+  }
+  if (use_sparse_shared_memory && vulkan_device->properties().sparseResidencyBuffer) {
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) == VK_SUCCESS) {
       VkMemoryRequirements buffer_memory_requirements;
       dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
@@ -220,6 +265,7 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
       size = VK_WHOLE_SIZE;
       last_usage_ = usage;
     }
+    SetBarrierSource(BarrierSource::kUpload);
     command_processor_.PushBufferMemoryBarrier(
         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
@@ -273,6 +319,10 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+#if REX_PLATFORM_ANDROID
+  command_processor_.CountAndroidSharedMemoryUpload(UploadedBytes(upload_page_ranges,
+                                                                  page_size_log2()));
+#endif
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
@@ -337,7 +387,9 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
   switch (usage) {
     case Usage::kComputeWrite:
       stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
+      // Resolves write guest memory from compute: without the write bit the barrier before a
+      // later read did not cover those writes (D3D12 issues a UAV barrier there).
+      access_mask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
       return;
     case Usage::kTransferDestination:
       stage_mask = VK_PIPELINE_STAGE_TRANSFER_BIT;

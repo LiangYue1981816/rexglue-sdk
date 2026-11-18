@@ -13,6 +13,9 @@
 
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/gow2_framegen.h>
+#include <rex/graphics/d3d12/gow2_fsr.h>
+#include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -35,6 +38,24 @@ std::string D3D12GraphicsSystem::name() const {
     return d3d12_command_processor->GetWindowTitleText();
   }
   return "Direct3D 12";
+}
+
+X_STATUS D3D12GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
+  X_STATUS status = GraphicsSystem::SetupPresentation(app_context);
+  if (status != X_STATUS_SUCCESS) return status;
+  auto* presenter = dynamic_cast<ui::d3d12::D3D12Presenter*>(GraphicsSystem::presenter());
+  if (!presenter) return status;
+  presenter->SetSwapChainSource(&gow2::GetFrameGeneration());
+  return status;
+}
+
+void D3D12GraphicsSystem::Shutdown() {
+  if (auto* presenter = dynamic_cast<ui::d3d12::D3D12Presenter*>(GraphicsSystem::presenter())) {
+    presenter->SetSwapChainSource(nullptr);
+  }
+  GraphicsSystem::Shutdown();
+  gow2::GetFrameGeneration().Shutdown();
+  gow2::FsrShutdown();
 }
 
 void D3D12GraphicsSystem::CreateProvider(bool /*with_presentation*/) {

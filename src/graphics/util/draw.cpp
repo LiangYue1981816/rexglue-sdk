@@ -1045,8 +1045,15 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     depth_edram_info.format_is_64bpp = 0;
     depth_edram_info.fill_half_pixel_offset = uint32_t(fill_half_pixel_offset);
     info_out.depth_original_base = rb_depth_info.depth_base;
+    info_out.depth_original_base_virtual =
+        rb_depth_info.depth_base | (rb_depth_info.depth_base_bit_11 << xenos::kEdramBaseTilesBits);
+    info_out.depth_edram_base_tiles_virtual =
+        (info_out.depth_original_base_virtual + edram_base_offset_tiles) &
+        (xenos::kEdramVirtualTileCount - 1);
   } else {
     info_out.depth_original_base = 0;
+    info_out.depth_original_base_virtual = 0;
+    info_out.depth_edram_base_tiles_virtual = 0;
   }
   info_out.depth_edram_info = depth_edram_info;
   ResolveEdramInfo color_edram_info;
@@ -1076,8 +1083,15 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
       exp_bias = std::min(exp_bias + int32_t(5), int32_t(31));
     }
     info_out.color_original_base = color_info.color_base;
+    info_out.color_original_base_virtual =
+        color_info.color_base | (color_info.color_base_bit_11 << xenos::kEdramBaseTilesBits);
+    info_out.color_edram_base_tiles_virtual =
+        (info_out.color_original_base_virtual + (edram_base_offset_tiles << is_64bpp)) &
+        (xenos::kEdramVirtualTileCount - 1);
   } else {
     info_out.color_original_base = 0;
+    info_out.color_original_base_virtual = 0;
+    info_out.color_edram_base_tiles_virtual = 0;
   }
   info_out.color_edram_info = color_edram_info;
 

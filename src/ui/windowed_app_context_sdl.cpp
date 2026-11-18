@@ -175,6 +175,21 @@ void SDLWindowedAppContext::ProcessEvent(SDL_Event& event) {
       }
       break;
     }
+#if REX_PLATFORM_ANDROID
+    case SDL_EVENT_FINGER_DOWN:
+    case SDL_EVENT_FINGER_UP:
+    case SDL_EVENT_FINGER_MOTION:
+    case SDL_EVENT_FINGER_CANCELED: {
+      WindowSDL* window = GetWindow(event.tfinger.windowID);
+      if (!window && windows_.size() == 1) {
+        window = windows_.begin()->second;
+      }
+      if (window) {
+        window->HandleTouchEvent(event);
+      }
+      break;
+    }
+#endif
     default:
       break;
   }

@@ -170,7 +170,7 @@ class ContentManager {
   X_RESULT ReadContentHeaderFile(const std::string_view file_name, uint64_t xuid, uint32_t title_id,
                                  XContentType content_type, XCONTENT_AGGREGATE_DATA& data) const;
 
-  std::filesystem::path ResolveGameUserContentPath();
+  std::filesystem::path ResolveGameUserContentPath(const std::string& user_name);
   bool IsContentOpen(const XCONTENT_AGGREGATE_DATA& data) const;
   void CloseOpenedFilesFromContent(const std::string_view root_name);
 

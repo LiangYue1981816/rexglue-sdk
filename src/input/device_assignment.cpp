@@ -9,7 +9,10 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <algorithm>
+
 #include <rex/input/device_assignment.h>
+#include <rex/input/flags.h>
 
 namespace rex::input {
 
@@ -18,13 +21,16 @@ void SlotAssignment::OnDevicesChanged(const std::vector<DeviceInfo>& devices) {
     user.clear();
   }
 
+  // Clamp so the subtraction below cannot underflow.
+  const uint32_t first_user = std::min(REXCVAR_GET(input_pad_first_user), kMaxGuestUsers);
+
   // Key off the ordinal rather than list position, so unplugging pad one does
   // not promote pad two to player one.
   for (const auto& device : devices) {
     if (device.synthetic) {
       users_[0].push_back(device.id);
-    } else if (device.ordinal < kMaxGuestUsers) {
-      users_[device.ordinal].push_back(device.id);
+    } else if (device.ordinal < kMaxGuestUsers - first_user) {
+      users_[device.ordinal + first_user].push_back(device.id);
     }
   }
 }

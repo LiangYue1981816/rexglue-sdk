@@ -17,10 +17,15 @@
 
 #include <fmt/format.h>
 
+#include <rex/cvar.h>
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/platform/dynlib.h>
+
+REXCVAR_DEFINE_STRING(gpu_backend, "any", "GPU",
+                      "Graphics backend: any (D3D12 on Windows when available), d3d12 or vulkan")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::system {
 
@@ -45,6 +50,15 @@ std::string PluginFileName(std::string_view name) {
 #endif
 }
 
+std::filesystem::path PluginPath(std::string_view name) {
+#if REX_PLATFORM_ANDROID
+  // Inside an APK the plugin is reachable only by name, through the app's linker namespace.
+  return PluginFileName(name);
+#else
+  return rex::filesystem::GetExecutableFolder() / PluginFileName(name);
+#endif
+}
+
 // Plugins stay loaded for process lifetime: guest threads may still be in
 // plugin code pages at shutdown.
 std::vector<platform::DynamicLibrary>& LoadedPlugins() {
@@ -55,8 +69,8 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
 }  // namespace
 
 std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
-  auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
-  if (!std::filesystem::exists(path)) {
+  auto path = PluginPath(name);
+  if (!REX_PLATFORM_ANDROID && !std::filesystem::exists(path)) {
     REXSYS_ERROR(
         "GPU plugin '{}' not found at {}. Stage it next to the executable "
         "(GPU_PLUGINS {} in rexglue_configure_target).",
@@ -85,12 +99,17 @@ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::strin
     return nullptr;
   }
 
-  std::string backend_str(backend);
+  std::string backend_str(backend == "any" ? REXCVAR_GET(gpu_backend) : backend);
   GpuCreateInfo info{};
   info.struct_size = sizeof(GpuCreateInfo);
   info.backend = backend_str.c_str();
 
   IGraphicsSystem* graphics_system = create_fn(kGpuPluginAbiVersion, &info);
+  if (!graphics_system && backend_str != "any") {
+    REXSYS_ERROR("GPU backend '{}' is not available; falling back to 'any'.", backend_str);
+    info.backend = "any";
+    graphics_system = create_fn(kGpuPluginAbiVersion, &info);
+  }
   if (!graphics_system) {
     REXSYS_ERROR("GPU plugin '{}' factory returned no graphics system (backend '{}')", name,
                  backend_str);

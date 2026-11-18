@@ -117,11 +117,12 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       return nullptr;
     }
     if (!supported_features.vertexPipelineStoresAndAtomics) {
+      // Not supported on Mali. The feature is only enabled when supported (see
+      // XE_UI_VULKAN_FEATURE), and vertex shader memexport draws are skipped.
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics: "
+          "draws whose vertex shader exports to memory will be skipped",
           properties.deviceName);
-      return nullptr;
     }
     if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
       REXLOG_WARN(
@@ -643,6 +644,7 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     XE_UI_VULKAN_FEATURE(shaderCullDistance)
     XE_UI_VULKAN_FEATURE(sparseBinding)
     XE_UI_VULKAN_FEATURE(sparseResidencyBuffer)
+    XE_UI_VULKAN_FEATURE(shaderStorageImageExtendedFormats)
   }
 
   if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -762,6 +764,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
 
   // Vulkan 1.0.
 #include <rex/ui/vulkan/functions/device_1_0.inc>
+#if REX_PLATFORM_ANDROID
+#include <rex/ui/vulkan/functions/device_1_0_pipeline_cache.inc>
+#endif
 
   // Extensions promoted to a Vulkan version supported by the device.
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name)                                \

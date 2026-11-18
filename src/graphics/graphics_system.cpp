@@ -12,16 +12,24 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <utility>
 
+#include <fmt/format.h>
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#if REX_HAS_D3D12
+#include <rex/graphics/d3d12/command_processor.h>
+#endif
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -30,6 +38,13 @@
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
+
+#if REX_PLATFORM_WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
@@ -55,6 +70,93 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
   }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
+}
+
+constexpr auto kShaderStorageWaitSlice = std::chrono::milliseconds(100);
+constexpr auto kShaderStorageTitleInterval = std::chrono::milliseconds(500);
+constexpr auto kShaderStorageLogInterval = std::chrono::seconds(5);
+
+// Snapshot of the shader storage progress. Stays zero for backends that don't
+// report it yet.
+struct ShaderStorageProgress {
+  uint32_t shaders_done = 0;
+  uint32_t shaders_total = 0;
+  uint32_t pipelines_done = 0;
+  uint32_t pipelines_total = 0;
+};
+
+ShaderStorageProgress QueryShaderStorageProgress(
+    rex::graphics::CommandProcessor* command_processor) {
+  ShaderStorageProgress progress;
+#if REX_HAS_D3D12
+  auto* d3d12_command_processor =
+      dynamic_cast<rex::graphics::d3d12::D3D12CommandProcessor*>(command_processor);
+  if (d3d12_command_processor) {
+    auto d3d12_progress = d3d12_command_processor->GetShaderStorageProgress();
+    progress.shaders_done = d3d12_progress.shaders_done;
+    progress.shaders_total = d3d12_progress.shaders_total;
+    progress.pipelines_done = d3d12_progress.pipelines_done;
+    progress.pipelines_total = d3d12_progress.pipelines_total;
+  }
+#endif
+  return progress;
+}
+
+#if REX_PLATFORM_WIN32
+// Drains the UI thread's Win32 message queue so Windows doesn't flag the window
+// as not responding. SDL's window procedure only queues SDL events from here,
+// the app's own loop still handles them later.
+void PumpWindowMessages() {
+  MSG msg;
+  while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+    if (msg.message == WM_QUIT) {
+      // Keep the quit request for the app's own loop.
+      PostQuitMessage(int(msg.wParam));
+      break;
+    }
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+  }
+}
+#else
+void PumpWindowMessages() {}
+#endif
+
+// Keeps the UI thread pumping OS messages until done is set. Progress goes to
+// the window title, or to the log when the presenter has no window.
+void PumpWhileShaderStorageLoads(rex::graphics::CommandProcessor* command_processor,
+                                 const rex::ui::Presenter* presenter,
+                                 const std::atomic<bool>& done) {
+  using Clock = std::chrono::steady_clock;
+  // The window can be closed while waiting, so it's looked up on every pass.
+  auto find_window = [presenter]() -> rex::ui::Window* {
+    return presenter ? presenter->window() : nullptr;
+  };
+  rex::ui::Window* window = find_window();
+  const std::string original_title = window ? window->GetTitle() : std::string();
+  auto last_title_update = Clock::now();
+  auto last_log = last_title_update;
+  while (!done.load()) {
+    PumpWindowMessages();
+    window = find_window();
+    ShaderStorageProgress progress = QueryShaderStorageProgress(command_processor);
+    auto now = Clock::now();
+    if (window && now - last_title_update >= kShaderStorageTitleInterval) {
+      last_title_update = now;
+      window->SetTitle(fmt::format("{} - compiling shaders {}/{}, pipelines {}/{}",
+                                   original_title, progress.shaders_done, progress.shaders_total,
+                                   progress.pipelines_done, progress.pipelines_total));
+    }
+    if (!window && now - last_log >= kShaderStorageLogInterval) {
+      last_log = now;
+      REXGPU_INFO("Compiling shaders {}/{}, pipelines {}/{}", progress.shaders_done,
+                  progress.shaders_total, progress.pipelines_done, progress.pipelines_total);
+    }
+    std::this_thread::sleep_for(kShaderStorageWaitSlice);
+  }
+  if (rex::ui::Window* current_window = find_window()) {
+    current_window->SetTitle(original_title);
+  }
 }
 }  // namespace
 
@@ -166,7 +268,17 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             MarkVblank();
             last_frame_time += interval_ticks;
           }
+#if REX_PLATFORM_WIN32
+          // Windows rounds sleeps up to its timer tick (15.6 ms unless raised), so sleeping to the
+          // next vblank would miss one; poll instead.
           rex::thread::Sleep(std::chrono::milliseconds(1));
+#else
+          // Sleep to the next vblank: a fixed 1 ms poll woke this thread 1000 times a second even
+          // at 60 Hz.
+          uint64_t ticks_left = last_frame_time + interval_ticks - current_time;
+          rex::thread::Sleep(std::chrono::microseconds(
+              std::max<uint64_t>(1000, ticks_left * 1'000'000 / guest_tick_frequency)));
+#endif
         }
         return 0;
       }));
@@ -341,10 +453,30 @@ void GraphicsSystem::InvalidateGpuMemory() {
 
 void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                              uint32_t title_id, bool blocking) {
+  command_processor_->CallInThread([this, cache_root, title_id]() {
+    command_processor_->InitializeTextureReplacement(cache_root, title_id);
+  });
   if (!REXCVAR_GET(store_shaders)) {
     return;
   }
   if (blocking) {
+    if (app_context_ && app_context_->IsInUIThread()) {
+      // A plain fence wait here would leave the window unresponsive for minutes.
+      std::atomic<bool> done{false};
+      auto initialize = [this, cache_root, title_id, &done]() {
+        command_processor_->InitializeShaderStorage(cache_root, title_id, true);
+        done = true;
+      };
+      if (command_processor_->is_paused()) {
+        std::thread worker(initialize);
+        PumpWhileShaderStorageLoads(command_processor_.get(), presenter_.get(), done);
+        worker.join();
+      } else {
+        command_processor_->CallInThread(initialize);
+        PumpWhileShaderStorageLoads(command_processor_.get(), presenter_.get(), done);
+      }
+      return;
+    }
     if (command_processor_->is_paused()) {
       // Safe to run on any thread while the command processor is paused, no
       // race condition.

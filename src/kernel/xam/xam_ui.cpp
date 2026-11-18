@@ -10,6 +10,8 @@
  */
 
 #include <rex/logging.h>
+#include <rex/cvar.h>
+#include <rex/kernel/xam/host_ui_route.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
 #include <rex/system/flags.h>
@@ -19,6 +21,14 @@
 
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+REXCVAR_DEFINE_STRING(xam_device_selector_ui_command, "", "Kernel",
+                      "Name of a command cvar the host runs, as a system UI, when the game "
+                      "asks for the storage device selector with the UI forced; empty keeps "
+                      "the headless pick of device 1");
+REXCVAR_DEFINE_UINT32(xam_device_selector_ui_flags_mask, 0x200, "Kernel",
+                      "content_flags bits that route the device selector to "
+                      "xam_device_selector_ui_command (0x200 = XCONTENTFLAG_FORCE_SHOW_UI); "
+                      "0 routes every call");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -500,6 +510,37 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   return result;
 }
 
+X_RESULT DispatchDeviceSelectorHostUi(std::function<void(std::string_view)> command_callback,
+                                     uint32_t user_index, uint32_t content_flags,
+                                     mapped_u32 device_id_ptr, uint32_t overlapped) {
+  auto pre = []() { REX_KERNEL_STATE()->BroadcastNotification(0x9, true); };
+  auto run = [command_callback, user_index, content_flags, device_id_ptr]() -> X_RESULT {
+    ++xam_dialogs_shown_;
+    try {
+      command_callback(fmt::format("{} {}", user_index, content_flags));
+    } catch (...) {
+      REXKRNL_WARN("XamShowDeviceSelectorUI host UI command threw an exception");
+    }
+    --xam_dialogs_shown_;
+    if (device_id_ptr) {
+      *device_id_ptr = 1;
+    }
+    return X_ERROR_SUCCESS;
+  };
+  auto post = []() {
+    rex::thread::Sleep(std::chrono::milliseconds(100));
+    REX_KERNEL_STATE()->BroadcastNotification(0x9, false);
+  };
+  if (overlapped) {
+    REX_KERNEL_STATE()->CompleteOverlappedDeferred(run, overlapped, pre, post);
+    return X_ERROR_IO_PENDING;
+  }
+  pre();
+  auto result = run();
+  post();
+  return result;
+}
+
 u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_flags,
                                   u64 total_requested, mapped_u32 device_id_ptr,
                                   mapped_void overlapped) {
@@ -507,6 +548,22 @@ u32 XamShowDeviceSelectorUI_entry(u32 user_index, u32 content_type, u32 content_
                 uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
                 uint64_t(total_requested), device_id_ptr.guest_address(),
                 overlapped.guest_address());
+  const auto command = REXCVAR_GET(xam_device_selector_ui_command);
+  const auto* entry = command.empty() ? nullptr : rex::cvar::GetFlagInfo(command);
+  std::function<void(std::string_view)> command_callback;
+  if (entry && entry->type == rex::cvar::FlagType::Command) {
+    command_callback = entry->command_callback;
+  }
+  const bool host_ui = RouteDeviceSelectorToHostUi(
+      static_cast<bool>(command_callback), content_flags,
+      REXCVAR_GET(xam_device_selector_ui_flags_mask));
+  REXKRNL_INFO("XamShowDeviceSelectorUI user={} content_type=0x{:08X} flags=0x{:08X} -> {}",
+               uint32_t(user_index), uint32_t(content_type), uint32_t(content_flags),
+               host_ui ? fmt::format("host UI '{}'", command) : "headless");
+  if (host_ui) {
+    return DispatchDeviceSelectorHostUi(command_callback, user_index, content_flags,
+                                        device_id_ptr, overlapped.guest_address());
+  }
   return xeXamDispatchHeadless(
       [device_id_ptr]() -> X_RESULT {
         // NOTE: 0x00000001 is our dummy device ID from xam_content.cc

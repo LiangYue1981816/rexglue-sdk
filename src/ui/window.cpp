@@ -691,6 +691,16 @@ void Window::OnFileDrop(FileDropEvent& e, WindowDestructionReceiver& destruction
 }
 
 void Window::OnKeyDown(KeyEvent& e, WindowDestructionReceiver& destruction_receiver) {
+  if (e.virtual_key() == VirtualKey::kF12 &&
+      rex::cvar::Query<bool>("present_screenshot_key_enabled")) {
+    if (presenter_) {
+      presenter_->RequestScreenshot();
+    }
+    e.set_handled(true);
+  }
+  if (e.is_handled()) {
+    return;
+  }
   PropagateEventThroughInputListeners(
       [&e](auto listener) {
         listener->OnKeyDown(e);

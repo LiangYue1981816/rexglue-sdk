@@ -346,6 +346,8 @@ union ResolveEdramInfo {
     xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;
     uint32_t is_depth : 1;
     // With offset to the region that edram_offset_x/y_div_8 are relative to.
+    // 11 bits even with gpu_native_surfaces (see ResolveInfo::*_edram_base_tiles_virtual): the
+    // precompiled resolve shaders unpack the fields after this one at fixed bit offsets.
     uint32_t base_tiles : xenos::kEdramBaseTilesBits;
     uint32_t format : xenos::kRenderTargetFormatBits;
     uint32_t format_is_64bpp : 1;
@@ -485,6 +487,16 @@ struct ResolveInfo {
   // transfers between clears and first usage if clearing a subregion.
   uint32_t depth_original_base;
   uint32_t color_original_base;
+  // The same with RB_DEPTH_INFO::depth_base_bit_11 / RB_COLOR_INFO::color_base_bit_11
+  // (xenos::kEdramVirtualBaseTilesBits), and the depth_edram_info / color_edram_info base_tiles
+  // equivalents wrapped to xenos::kEdramVirtualTileCount instead of 11 bits. Only used by
+  // gpu_native_surfaces, whose ownership map covers xenos::kEdramVirtualTileCount tiles.
+  // ResolveEdramInfo::base_tiles stays 11-bit: the shaders address the 2048-tile EDRAM buffer
+  // modulo 2048, and the virtual base is congruent to it modulo 2048.
+  uint32_t depth_original_base_virtual;
+  uint32_t color_original_base_virtual;
+  uint32_t depth_edram_base_tiles_virtual;
+  uint32_t color_edram_base_tiles_virtual;
 
   ResolveCoordinateInfo coordinate_info;
   // Like coordinate_info.width_div_8, but not needed for shaders.

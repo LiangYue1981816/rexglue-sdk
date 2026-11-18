@@ -34,6 +34,12 @@
 #include <shellapi.h>
 #endif
 
+#if REX_PLATFORM_ANDROID
+// SDLActivity runs SDL_main from the last library it loads. SDL_main.h declares it with C linkage
+// and default visibility and renames main() below to it.
+#include <SDL3/SDL_main.h>
+#endif
+
 namespace {
 
 int RunWindowedApp(int argc, char** argv) {

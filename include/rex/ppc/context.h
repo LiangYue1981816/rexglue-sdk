@@ -147,8 +147,6 @@ constexpr uint32_t kRoundMask = 0x03;
 struct FPSCRRegister {
   uint32_t csr;
 
-  static constexpr size_t HostToGuest[] = {kRoundNearest, kRoundDown, kRoundUp, kRoundTowardZero};
-
   using Platform = platform::FPSCRPlatform;
   static constexpr size_t RoundShift = Platform::RoundShift;
   static constexpr size_t RoundMaskVal = Platform::RoundMaskVal;
@@ -168,7 +166,8 @@ struct FPSCRRegister {
 
   inline uint32_t loadFromHost() noexcept {
     csr = getcsr();
-    return HostToGuest[(csr & RoundMaskVal) >> RoundShift];
+    // Each host's own table: FPCR.RMode is not ordered like MXCSR.RC.
+    return platform::GuestRoundingFromHost<Platform>(csr);
   }
 
   inline void storeFromGuest(uint32_t value) noexcept {

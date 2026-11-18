@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -49,6 +50,27 @@
 #include <rex/types.h>
 #include <rex/ui/vulkan/util.h>
 
+static std::atomic<uint32_t> shader_storage_play_shader_count{0};
+static std::atomic<uint32_t> shader_storage_play_pipeline_count{0};
+static std::atomic<bool> shader_storage_play_counting{false};
+
+static void LogShaderStoragePlayCount(uint32_t count) {
+  if (count < 16 || (count & (count - 1)) != 0) {
+    return;
+  }
+  REXGPU_INFO("SHADERSTORAGE compiled during play: {} shaders, {} pipelines",
+              shader_storage_play_shader_count.load(std::memory_order_relaxed),
+              shader_storage_play_pipeline_count.load(std::memory_order_relaxed));
+}
+
+static void CountShaderStoragePlay(std::atomic<uint32_t>& counter) {
+  if (!shader_storage_play_counting.load(std::memory_order_relaxed)) {
+    return;
+  }
+  const uint32_t count = counter.fetch_add(1, std::memory_order_relaxed) + 1;
+  LogShaderStoragePlayCount(count);
+}
+
 REXCVAR_DEFINE_INT32(
     vulkan_pipeline_creation_threads, -1, "GPU/Vulkan",
     "Number of pipeline creation threads for Vulkan async pipeline creation (-1 for auto)")
@@ -59,9 +81,196 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_BOOL(
+    vulkan_pipeline_cache_file, true, "GPU/Vulkan",
+    "Keep the driver's compiled pipelines in <title>.vkpc beside the shader storage and give them "
+    "back to the driver at the next launch, so the stored pipelines are not compiled again at "
+    "every boot")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_android_empty_fragment_shader, false, "GPU/Vulkan",
+                    "Give pipelines without a Xenos pixel shader an empty fragment shader when "
+                    "color targets are bound (with write mask 0), instead of no fragment stage, "
+                    "which some Adreno drivers mishandle")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(vulkan_async_pipeline_placeholders, true, "GPU/Vulkan",
+                    "With async_shader_compilation, build a placeholder pipeline (the real vertex "
+                    "shader and a discarding pixel shader) on the GPU command thread before "
+                    "queuing the real one. Its draws are skipped anyway: off skips them without "
+                    "building it, and also builds pipelines without a pixel shader in the "
+                    "background")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(vulkan_android_depth_experiment, 0, "GPU/Vulkan",
+                     "Diagnostic bits for scene parts that stay black (each draws the scene "
+                     "wrongly; 0 is normal): 1 makes draws that write color but not depth pass "
+                     "their depth test always, 2 skips draws without a pixel shader on the float24 "
+                     "depth buffer (the depth prepass), 4 turns the stencil test off for draws "
+                     "that write color, 8 replaces the guest scissor with the whole target, 16 "
+                     "paints draws with a pixel shader and the depth test on in magenta, 32 turns "
+                     "face culling off, 64 drops user clip planes and the vertex kill flag, 128 "
+                     "skips the depth prepass meshes on the float24 depth buffer but keeps its "
+                     "depth clears (rectangle lists), 256 makes every draw with a pixel shader that "
+                     "writes color on the float24 depth buffer pass its depth test (depth writers "
+                     "too), 512 skips the depth clear rectangles drawn after the frame's prepass "
+                     "began, 1024 paints the prepass in magenta where color target 0 is bound")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(vulkan_android_paint_shader_hashes, "", "GPU/Vulkan",
+                      "Diagnostic: draws whose vertex or pixel shader has one of these ucode hashes "
+                      "(16 hex digits each, comma-separated, as FRAMETRACE prints them) write "
+                      "magenta; empty is off")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
 namespace rex::graphics::vulkan {
 
 namespace {
+
+#if REX_PLATFORM_ANDROID
+constexpr int64_t kAndroidPipelineCacheSaveIntervalSeconds = 120;
+
+std::vector<uint8_t> ReadAndroidPipelineCacheFile(const std::filesystem::path& path) {
+  FILE* file = rex::filesystem::OpenFile(path, "rb");
+  if (!file) {
+    return {};
+  }
+  std::vector<uint8_t> data;
+  if (fseek(file, 0, SEEK_END) == 0) {
+    const long size = ftell(file);
+    if (size > 0 && fseek(file, 0, SEEK_SET) == 0) {
+      data.resize(static_cast<size_t>(size));
+      if (fread(data.data(), 1, data.size(), file) != data.size()) {
+        data.clear();
+      }
+    }
+  }
+  fclose(file);
+  return data;
+}
+
+bool GetAndroidPipelineCacheData(const ui::vulkan::VulkanDevice& device, VkPipelineCache cache,
+                                 std::vector<uint8_t>& data) {
+  const auto& dfn = device.functions();
+  for (uint32_t attempt = 0; attempt < 3; ++attempt) {
+    size_t size = 0;
+    VkResult result = dfn.vkGetPipelineCacheData(device.device(), cache, &size, nullptr);
+    if (result == VK_INCOMPLETE) {
+      continue;
+    }
+    if (result != VK_SUCCESS) {
+      REXGPU_WARN("VulkanPipelineCache: pipeline cache size query failed ({})", int32_t(result));
+      return false;
+    }
+    data.resize(size);
+    result = dfn.vkGetPipelineCacheData(device.device(), cache, &size, data.data());
+    if (result == VK_INCOMPLETE) {
+      continue;
+    }
+    if (result != VK_SUCCESS) {
+      REXGPU_WARN("VulkanPipelineCache: pipeline cache data query failed ({})", int32_t(result));
+      return false;
+    }
+    data.resize(size);
+    return true;
+  }
+  REXGPU_WARN("VulkanPipelineCache: pipeline cache data remained incomplete after 3 attempts");
+  return false;
+}
+
+bool WriteAndroidPipelineCacheFile(const std::filesystem::path& path,
+                                   const std::vector<uint8_t>& data) {
+  std::filesystem::path temporary_path = path;
+  temporary_path += ".tmp";
+  FILE* file = rex::filesystem::OpenFile(temporary_path, "wb");
+  bool written = false;
+  if (file) {
+    written = fwrite(data.data(), 1, data.size(), file) == data.size();
+    if (fclose(file) != 0) {
+      written = false;
+    }
+  }
+  std::error_code error;
+  if (written) {
+    std::filesystem::rename(temporary_path, path, error);
+    if (!error) {
+      return true;
+    }
+  }
+  REXGPU_WARN("VulkanPipelineCache: failed to save pipeline cache file {}",
+              rex::path_to_utf8(path));
+  std::filesystem::remove(temporary_path, error);
+  return false;
+}
+
+constexpr std::string_view kEmptyFragmentShaderSource = R"(#version 460
+void main() {}
+)";
+
+constexpr int32_t kAndroidExperimentNoStencilForColor = 4;
+
+bool IsAndroidExperimentOn(int32_t bit) {
+  return (REXCVAR_GET(vulkan_android_depth_experiment) & bit) != 0;
+}
+
+bool IsFloat24DepthBound(VulkanRenderTargetCache::RenderPassKey render_pass_key) {
+  return (render_pass_key.depth_and_color_used & 1) &&
+         render_pass_key.depth_format == xenos::DepthRenderTargetFormat::kD24FS8;
+}
+
+bool IsAndroidDepthTestRelaxed(bool has_pixel_shader, uint32_t normalized_color_mask,
+                               reg::RB_DEPTHCONTROL normalized_depth_control,
+                               VulkanRenderTargetCache::RenderPassKey render_pass_key) {
+  return android_experiments::IsColorDepthTestRelaxed(
+      REXCVAR_GET(vulkan_android_depth_experiment), has_pixel_shader, normalized_color_mask,
+      normalized_depth_control.z_write_enable != 0, IsFloat24DepthBound(render_pass_key));
+}
+
+// Opaque writes of all four channels, for draws painted magenta without a guest pixel shader.
+reg::RB_BLENDCONTROL GetAndroidOpaqueBlendControl() {
+  reg::RB_BLENDCONTROL blend_control;
+  blend_control.value = 0;
+  blend_control.color_srcblend = xenos::BlendFactor::kOne;
+  blend_control.color_comb_fcn = xenos::BlendOp::kAdd;
+  blend_control.color_destblend = xenos::BlendFactor::kZero;
+  blend_control.alpha_srcblend = xenos::BlendFactor::kOne;
+  blend_control.alpha_comb_fcn = xenos::BlendOp::kAdd;
+  blend_control.alpha_destblend = xenos::BlendFactor::kZero;
+  return blend_control;
+}
+
+bool IsAndroidStencilTestDropped(bool has_pixel_shader, uint32_t normalized_color_mask) {
+  return IsAndroidExperimentOn(kAndroidExperimentNoStencilForColor) && has_pixel_shader &&
+         normalized_color_mask;
+}
+
+bool IsAndroidCullingDropped() {
+  constexpr int32_t kAndroidExperimentNoCulling = 32;
+  return IsAndroidExperimentOn(kAndroidExperimentNoCulling);
+}
+
+bool IsAndroidClipAndKillDropped() {
+  constexpr int32_t kAndroidExperimentNoClipPlanesOrVertexKill = 64;
+  return IsAndroidExperimentOn(kAndroidExperimentNoClipPlanesOrVertexKill);
+}
+
+constexpr int32_t kAndroidExperimentPaintDepthTestedColor = 16;
+
+constexpr std::string_view kPaintFragmentShaderSource = R"(#version 460
+layout(location = 0) out vec4 o0;
+layout(location = 1) out vec4 o1;
+layout(location = 2) out vec4 o2;
+layout(location = 3) out vec4 o3;
+void main() {
+  o0 = vec4(1.0, 0.0, 1.0, 1.0);
+  o1 = o0;
+  o2 = o0;
+  o3 = o0;
+}
+)";
+#endif
 
 constexpr std::string_view kPlaceholderPixelShaderSource = R"(#version 460
 layout(location = 0) out vec4 oC0;
@@ -91,7 +300,10 @@ constexpr bool IsPatchIndexedHostVertexShaderType(
 
 std::string GetTessellationSystemConstantsBlockGlsl() {
   std::string source;
-  source += "layout(set = 0, binding = 0, std140) uniform XeSystemConstants {\n";
+  // The system constants are in the constants set; set 0 holds the shared memory and the EDRAM.
+  source += fmt::format("layout(set = {}, binding = {}, std140) uniform XeSystemConstants {{\n",
+                        uint32_t(SpirvShaderTranslator::kDescriptorSetConstants),
+                        uint32_t(SpirvShaderTranslator::kConstantBufferSystem));
   source += fmt::format("  layout(offset = {}) uint xe_vertex_index_endian;\n",
                         offsetof(SpirvShaderTranslator::SystemConstants, vertex_index_endian));
   source += fmt::format("  layout(offset = {}) int xe_vertex_base_index;\n",
@@ -128,7 +340,7 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {
@@ -162,13 +374,13 @@ uint xe_swap_16_in_32(uint value) {
 void main() {
   uint value = uint(gl_VertexIndex);
   uint endian = xe_system_cbuffer.xe_vertex_index_endian;
-  if (endian == 1u || endian == 2u || endian == 3u) {
+  if (endian == 1u || endian == 2u) {
     value = xe_swap_8_in_16(value);
   }
   if (endian == 2u || endian == 3u) {
     value = xe_swap_16_in_32(value);
   }
-  float tessellation_factor = float(value) + 1.0;
+  float tessellation_factor = uintBitsToFloat(value) + 1.0;
   tessellation_factor = max(
       tessellation_factor, xe_system_cbuffer.xe_tessellation_factor_range_min);
   tessellation_factor = min(
@@ -357,6 +569,16 @@ bool VulkanPipelineCache::Initialize() {
         "VulkanPipelineCache: Failed to create placeholder pixel shader - "
         "async placeholder hot-swap will be unavailable");
   }
+#if REX_PLATFORM_ANDROID
+  if (REXCVAR_GET(vulkan_android_empty_fragment_shader) && !edram_fragment_shader_interlock) {
+    CreateEmptyFragmentShader();
+  }
+  android_paint_shader_hashes_ = android_experiments::ParseShaderHashList(
+      std::string(REXCVAR_GET(vulkan_android_paint_shader_hashes)));
+  if (IsAnyAndroidPaintRequested() && !edram_fragment_shader_interlock) {
+    CreatePaintFragmentShader();
+  }
+#endif
 
   uint32_t logical_processor_count = rex::thread::logical_processor_count();
   if (!logical_processor_count) {
@@ -388,9 +610,101 @@ bool VulkanPipelineCache::Initialize() {
   return true;
 }
 
+#if REX_PLATFORM_ANDROID
+pipeline_cache_file::DeviceIdentity VulkanPipelineCache::GetAndroidDeviceIdentity() const {
+  const auto* vulkan_device = command_processor_.GetVulkanDevice();
+  VkPhysicalDeviceProperties properties;
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+      vulkan_device->physical_device(), &properties);
+  pipeline_cache_file::DeviceIdentity identity;
+  identity.vendor_id = properties.vendorID;
+  identity.device_id = properties.deviceID;
+  identity.driver_version = properties.driverVersion;
+  std::memcpy(identity.pipeline_cache_uuid, properties.pipelineCacheUUID,
+              sizeof(identity.pipeline_cache_uuid));
+  return identity;
+}
+
+void VulkanPipelineCache::OpenAndroidPipelineCache(const std::filesystem::path& path) {
+  if (!REXCVAR_GET(vulkan_pipeline_cache_file)) {
+    return;
+  }
+  android_pipeline_cache_path_ = path;
+  android_pipeline_cache_saved_hash_ = 0;
+  if (android_pipeline_cache_.load(std::memory_order_acquire) != VK_NULL_HANDLE) {
+    return;
+  }
+  const auto file = ReadAndroidPipelineCacheFile(path);
+  const auto unwrapped =
+      pipeline_cache_file::Unwrap(file.data(), file.size(), GetAndroidDeviceIdentity());
+  REXGPU_INFO("VulkanPipelineCache: pipeline cache file {}: {} ({} bytes of driver data)",
+              rex::path_to_utf8(path), pipeline_cache_file::LoadStatusName(unwrapped.status),
+              unwrapped.data_size);
+  VkPipelineCacheCreateInfo create_info{};
+  create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (unwrapped.status == pipeline_cache_file::LoadStatus::kOk) {
+    create_info.initialDataSize = unwrapped.data_size;
+    create_info.pInitialData = file.data() + unwrapped.data_offset;
+  }
+  const auto* vulkan_device = command_processor_.GetVulkanDevice();
+  const auto& dfn = vulkan_device->functions();
+  VkPipelineCache cache = VK_NULL_HANDLE;
+  VkResult result =
+      dfn.vkCreatePipelineCache(vulkan_device->device(), &create_info, nullptr, &cache);
+  if (result != VK_SUCCESS && create_info.initialDataSize != 0) {
+    REXGPU_WARN("VulkanPipelineCache: failed to create pipeline cache from file ({}), retrying empty",
+                int32_t(result));
+    create_info.initialDataSize = 0;
+    create_info.pInitialData = nullptr;
+    result = dfn.vkCreatePipelineCache(vulkan_device->device(), &create_info, nullptr, &cache);
+  }
+  if (result != VK_SUCCESS) {
+    REXGPU_WARN("VulkanPipelineCache: failed to create empty pipeline cache ({})", int32_t(result));
+    return;
+  }
+  android_pipeline_cache_.store(cache, std::memory_order_release);
+}
+
+void VulkanPipelineCache::RequestAndroidPipelineCacheSave() {
+  android_pipeline_cache_save_requested_at_ = std::chrono::steady_clock::now();
+  {
+    std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+    storage_write_save_pipeline_cache_ = true;
+  }
+  storage_write_request_cond_.notify_one();
+}
+
+void VulkanPipelineCache::SaveAndroidPipelineCache() {
+  const VkPipelineCache cache = android_pipeline_cache_.load(std::memory_order_acquire);
+  if (cache == VK_NULL_HANDLE || android_pipeline_cache_path_.empty()) {
+    return;
+  }
+  android_pipelines_since_cache_save_.exchange(0, std::memory_order_relaxed);
+  std::vector<uint8_t> data;
+  if (!GetAndroidPipelineCacheData(*command_processor_.GetVulkanDevice(), cache, data)) {
+    return;
+  }
+  const uint64_t hash = pipeline_cache_file::HashData(data.data(), data.size());
+  if (hash == android_pipeline_cache_saved_hash_) {
+    return;
+  }
+  const auto wrapped = pipeline_cache_file::Wrap(GetAndroidDeviceIdentity(), data.data(), data.size());
+  if (!WriteAndroidPipelineCacheFile(android_pipeline_cache_path_, wrapped)) {
+    return;
+  }
+  android_pipeline_cache_saved_hash_ = hash;
+  REXGPU_INFO("VulkanPipelineCache: saved {} bytes of driver pipeline cache to {}", data.size(),
+              rex::path_to_utf8(android_pipeline_cache_path_));
+}
+#endif
+
 void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                   uint32_t title_id, bool blocking) {
   ShutdownShaderStorage();
+  shader_storage_play_counting.store(false, std::memory_order_relaxed);
+  shader_storage_play_shader_count.store(0, std::memory_order_relaxed);
+  shader_storage_play_pipeline_count.store(0, std::memory_order_relaxed);
+  const auto shader_storage_load_start = std::chrono::steady_clock::now();
   {
     std::lock_guard<std::mutex> lock(creation_request_lock_);
     startup_loading_ = false;
@@ -407,6 +721,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       return;
     }
   }
+
+#if REX_PLATFORM_ANDROID
+  OpenAndroidPipelineCache(shader_storage_shareable_root / fmt::format("{:08X}.vkpc", title_id));
+#endif
 
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
@@ -520,6 +838,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   } shader_storage_file_header;
   // 'XESH'.
   const uint32_t shader_storage_magic = 0x48534558;
+  size_t shaders_loaded_from_storage = 0;
   if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
             shader_storage_file_) &&
       shader_storage_file_header.magic == shader_storage_magic &&
@@ -554,6 +873,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
       }
       // Loaded from the current storage - don't write again.
       shader->set_ucode_storage_index(shader_storage_index_);
+      ++shaders_loaded_from_storage;
     }
     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
   } else {
@@ -706,12 +1026,28 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
   shader_storage_title_id_ = title_id;
 
   // Start the storage writing thread.
+#if REX_PLATFORM_ANDROID
+  {
+    std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+    storage_write_save_pipeline_cache_ =
+        android_pipelines_since_cache_save_.load(std::memory_order_relaxed) != 0;
+  }
+  android_pipeline_cache_save_requested_at_ = std::chrono::steady_clock::now();
+#endif
   storage_write_flush_shaders_ = false;
   storage_write_flush_pipelines_ = false;
   storage_write_thread_shutdown_ = false;
   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
   assert_not_null(storage_write_thread_);
   storage_write_thread_->set_name("Vulkan Storage writer");
+  REXGPU_INFO(
+      "SHADERSTORAGE loaded {} shaders and {} pipelines in {} ms ({})",
+      shaders_loaded_from_storage, pipeline_stored_descriptions.size(),
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - shader_storage_load_start)
+          .count(),
+      rex::path_to_utf8(pipeline_storage_file_path));
+  shader_storage_play_counting.store(true, std::memory_order_relaxed);
 }
 
 void VulkanPipelineCache::ShutdownShaderStorage() {
@@ -724,6 +1060,14 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
     rex::thread::Wait(storage_write_thread_.get(), false);
     storage_write_thread_.reset();
   }
+#if REX_PLATFORM_ANDROID
+  SaveAndroidPipelineCache();
+  android_pipeline_cache_path_.clear();
+  {
+    std::lock_guard<std::mutex> lock(storage_write_request_lock_);
+    storage_write_save_pipeline_cache_ = false;
+  }
+#endif
   storage_write_shader_queue_.clear();
   storage_write_pipeline_queue_.clear();
 
@@ -741,9 +1085,22 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
 
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
+  if (shader_storage_play_counting.exchange(false, std::memory_order_relaxed)) {
+    REXGPU_INFO("SHADERSTORAGE compiled during play: {} shaders, {} pipelines",
+                shader_storage_play_shader_count.load(std::memory_order_relaxed),
+                shader_storage_play_pipeline_count.load(std::memory_order_relaxed));
+  }
 }
 
 void VulkanPipelineCache::EndSubmission() {
+#if REX_PLATFORM_ANDROID
+  if (android_pipeline_cache_.load(std::memory_order_acquire) != VK_NULL_HANDLE &&
+      android_pipelines_since_cache_save_.load(std::memory_order_relaxed) != 0 &&
+      std::chrono::steady_clock::now() - android_pipeline_cache_save_requested_at_ >=
+          std::chrono::seconds(kAndroidPipelineCacheSaveIntervalSeconds)) {
+    RequestAndroidPipelineCacheSave();
+  }
+#endif
   if (shader_storage_file_flush_needed_ || pipeline_storage_file_flush_needed_) {
     {
       std::lock_guard<std::mutex> lock(storage_write_request_lock_);
@@ -822,6 +1179,15 @@ void VulkanPipelineCache::Shutdown() {
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
 
+#if REX_PLATFORM_ANDROID
+  const VkPipelineCache pipeline_cache =
+      android_pipeline_cache_.load(std::memory_order_acquire);
+  if (pipeline_cache != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, pipeline_cache, nullptr);
+  }
+  android_pipeline_cache_.store(VK_NULL_HANDLE, std::memory_order_release);
+#endif
+
   ProcessDeferredPipelineDestructions(true);
 
   // Destroy all pipelines.
@@ -843,6 +1209,12 @@ void VulkanPipelineCache::Shutdown() {
                                          depth_float24_round_fragment_shader_);
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
                                          placeholder_pixel_shader_);
+#if REX_PLATFORM_ANDROID
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         empty_fragment_shader_);
+  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
+                                         paint_fragment_shader_);
+#endif
   if (tessellation_indexed_vertex_shader_ != VK_NULL_HANDLE) {
     dfn.vkDestroyShaderModule(device, tessellation_indexed_vertex_shader_, nullptr);
     tessellation_indexed_vertex_shader_ = VK_NULL_HANDLE;
@@ -954,6 +1326,13 @@ SpirvShaderTranslator::Modification VulkanPipelineCache::GetCurrentVertexShaderM
   modification.vertex.vertex_kill_and = uint32_t(
       device_properties.shaderCullDistance &&
       (shader.writes_point_size_edge_flag_kill_vertex() & 0b100) && !pa_cl_clip_cntl.vtx_kill_or);
+#if REX_PLATFORM_ANDROID
+  if (IsAndroidClipAndKillDropped()) {
+    modification.vertex.user_clip_plane_count = 0;
+    modification.vertex.user_clip_plane_cull = 0;
+    modification.vertex.vertex_kill_and = 0;
+  }
+#endif
 
   return modification;
 }
@@ -1113,6 +1492,10 @@ bool VulkanPipelineCache::ConfigurePipeline(
 
   bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
                    pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+#if REX_PLATFORM_ANDROID
+  const bool skip_placeholder = CanQueueWithoutPlaceholder();
+  use_async = use_async || skip_placeholder;
+#endif
   uint8_t async_priority = pipeline_util::kPriorityLowest;
   if (use_async) {
     uint32_t bound_rts =
@@ -1128,6 +1511,13 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+#if REX_PLATFORM_ANDROID
+    if (IsPendingWithoutPlaceholder(it->second)) {
+      return ReturnPendingPipeline(*it, pipeline_out, pipeline_layout_out, pipeline_handle_out);
+    }
+    // A background creation that just finished published the pipeline before clearing the flag.
+    found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
+#endif
     if (found_pipeline == VK_NULL_HANDLE) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
@@ -1157,6 +1547,13 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
+#if REX_PLATFORM_ANDROID
+  if (use_async && skip_placeholder) {
+    creation_arguments_real.priority = async_priority;
+    QueuePendingPipelineCreation(creation_arguments_real);
+    queued_async_creation = true;
+  } else
+#endif
   if (use_async) {
     creation_arguments_real.priority = async_priority;
     PipelineCreationArguments creation_arguments_placeholder;
@@ -1197,6 +1594,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
     storage_write_request_cond_.notify_all();
   }
   last_pipeline_ = &pipeline;
+#if REX_PLATFORM_ANDROID
+  if (IsPendingWithoutPlaceholder(pipeline.second)) {
+    return ReturnPendingPipeline(pipeline, pipeline_out, pipeline_layout_out, pipeline_handle_out);
+  }
+#endif
   pipeline_out = pipeline.second.pipeline.load(std::memory_order_acquire);
   pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
   if (pipeline_handle_out) {
@@ -1225,10 +1627,18 @@ void VulkanPipelineCache::GetPipelineAndLayoutByHandle(
     return;
   }
   const auto* pipeline = reinterpret_cast<const Pipeline*>(handle);
+#if REX_PLATFORM_ANDROID
+  // The flag first: a pipeline created without a placeholder is published before its flag clears.
+  const bool is_placeholder = pipeline->is_placeholder.load(std::memory_order_acquire);
+#endif
   pipeline_out = pipeline->pipeline.load(std::memory_order_acquire);
   pipeline_layout_out = pipeline->pipeline_layout.load(std::memory_order_acquire);
   if (is_placeholder_out) {
+#if REX_PLATFORM_ANDROID
+    *is_placeholder_out = is_placeholder;
+#else
     *is_placeholder_out = pipeline->is_placeholder.load(std::memory_order_acquire);
+#endif
   }
 }
 
@@ -1245,6 +1655,7 @@ bool VulkanPipelineCache::TranslateAnalyzedShader(SpirvShaderTranslator& transla
   if (translation.GetOrCreateShaderModule() == VK_NULL_HANDLE) {
     return false;
   }
+  CountShaderStoragePlay(shader_storage_play_shader_count);
 
   // TODO(Triang3l): Log that the shader has been successfully translated in
   // common code.
@@ -1483,6 +1894,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
     // highest) based on which faces are not culled.
     bool cull_front = pa_su_sc_mode_cntl.cull_front;
     bool cull_back = pa_su_sc_mode_cntl.cull_back;
+#if REX_PLATFORM_ANDROID
+    if (IsAndroidCullingDropped()) {
+      cull_front = false;
+      cull_back = false;
+    }
+#endif
     description_out.cull_front = cull_front;
     description_out.cull_back = cull_back;
     if (device_properties.fillModeNonSolid) {
@@ -1527,6 +1944,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
       if (normalized_depth_control.z_enable) {
         description_out.depth_write_enable = normalized_depth_control.z_write_enable;
         description_out.depth_compare_op = normalized_depth_control.zfunc;
+#if REX_PLATFORM_ANDROID
+        if (IsAndroidDepthTestRelaxed(pixel_shader != nullptr, normalized_color_mask,
+                                      normalized_depth_control, render_pass_key)) {
+          description_out.depth_compare_op = xenos::CompareFunction::kAlways;
+        }
+#endif
       } else {
         description_out.depth_compare_op = xenos::CompareFunction::kAlways;
       }
@@ -1548,6 +1971,11 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           description_out.stencil_back_compare_op = description_out.stencil_front_compare_op;
         }
       }
+#if REX_PLATFORM_ANDROID
+      if (IsAndroidStencilTestDropped(pixel_shader != nullptr, normalized_color_mask)) {
+        description_out.stencil_test_enable = 0;
+      }
+#endif
     }
 
     // Color blending and write masks (filled only for the attachments present
@@ -1563,6 +1991,12 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
           (normalized_color_mask >> (color_rt_index * 4)) & 0b1111,
           description_out.render_targets[color_rt_index]);
     }
+#if REX_PLATFORM_ANDROID
+    if (IsPaintedWithoutPixelShader(description_out)) {
+      WritePipelineRenderTargetDescription(GetAndroidOpaqueBlendControl(), 0b1111,
+                                           description_out.render_targets[0]);
+    }
+#endif
   }
 
   return true;
@@ -3151,6 +3585,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
       }
     }
   }
+#if REX_PLATFORM_ANDROID
+  if (shader_stage_fragment.module == VK_NULL_HANDLE && NeedsEmptyFragmentShader(description)) {
+    shader_stage_fragment.module = empty_fragment_shader_;
+  }
+  if (IsPaintedPipeline(description, creation_arguments.pixel_shader != nullptr)) {
+    shader_stage_fragment.module = paint_fragment_shader_;
+  }
+#endif
   if (shader_stage_fragment.module == VK_NULL_HANDLE) {
     --shader_stage_count;
   }
@@ -3480,8 +3922,14 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
+#if REX_PLATFORM_ANDROID
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(
+      device, android_pipeline_cache_.load(std::memory_order_acquire), 1,
+      &pipeline_create_info, nullptr, &pipeline);
+#else
   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
                                                          &pipeline_create_info, nullptr, &pipeline);
+#endif
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
@@ -3497,6 +3945,10 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
         uint32_t(use_dynamic_rendering));
     return false;
   }
+  CountShaderStoragePlay(shader_storage_play_pipeline_count);
+#if REX_PLATFORM_ANDROID
+  android_pipelines_since_cache_save_.fetch_add(1, std::memory_order_relaxed);
+#endif
   bool was_placeholder =
       creation_arguments.pipeline->second.is_placeholder.load(std::memory_order_acquire);
   VkPipeline old_pipeline =
@@ -3550,6 +4002,9 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+#if REX_PLATFORM_ANDROID
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+#endif
       }
     }
 
@@ -3583,10 +4038,131 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       } else {
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+#if REX_PLATFORM_ANDROID
+        creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
+#endif
       }
     }
   }
 }
+
+#if REX_PLATFORM_ANDROID
+void VulkanPipelineCache::CreateEmptyFragmentShader() {
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                             kEmptyFragmentShaderSource, spirv, compile_error)) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to compile the empty fragment shader: {}",
+                compile_error);
+    return;
+  }
+  empty_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
+      command_processor_.GetVulkanDevice(), spirv.data(), spirv.size() * sizeof(uint32_t));
+  if (empty_fragment_shader_ == VK_NULL_HANDLE) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to create the empty fragment shader module");
+    return;
+  }
+  REXGPU_INFO(
+      "VulkanPipelineCache: pipelines without a pixel shader get an empty fragment shader when "
+      "color targets are bound");
+}
+
+void VulkanPipelineCache::CreatePaintFragmentShader() {
+  std::vector<uint32_t> spirv;
+  std::string compile_error;
+  if (!command_processor_.CompileGlslToSpirv(VK_SHADER_STAGE_FRAGMENT_BIT,
+                                             kPaintFragmentShaderSource, spirv, compile_error)) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to compile the paint fragment shader: {}",
+                compile_error);
+    return;
+  }
+  paint_fragment_shader_ = ui::vulkan::util::CreateShaderModule(
+      command_processor_.GetVulkanDevice(), spirv.data(), spirv.size() * sizeof(uint32_t));
+  REXGPU_INFO("VulkanPipelineCache: the draws the diagnostics select are painted magenta");
+}
+
+bool VulkanPipelineCache::IsAnyAndroidPaintRequested() const {
+  return IsAndroidExperimentOn(kAndroidExperimentPaintDepthTestedColor) ||
+         IsAndroidExperimentOn(android_experiments::kPaintPrepass) ||
+         !android_paint_shader_hashes_.empty();
+}
+
+// Bit 1024, or a listed vertex shader, on a draw without a pixel shader: the paint shader needs
+// color target 0 bound, and its write mask opened (the guest's is 0 without a pixel shader).
+bool VulkanPipelineCache::IsPaintedWithoutPixelShader(
+    const PipelineDescription& description) const {
+  const auto& key = description.render_pass_key;
+  const bool color_0_bound = (key.depth_and_color_used & 0b10) != 0;
+  if (paint_fragment_shader_ == VK_NULL_HANDLE || description.pixel_shader_hash ||
+      !color_0_bound) {
+    return false;
+  }
+  if (android_experiments::ContainsHash(android_paint_shader_hashes_,
+                                        description.vertex_shader_hash)) {
+    return true;
+  }
+  return android_experiments::IsPrepassPainted(REXCVAR_GET(vulkan_android_depth_experiment),
+                                               false, IsFloat24DepthBound(key), color_0_bound);
+}
+
+bool VulkanPipelineCache::IsPaintedPipeline(const PipelineDescription& description,
+                                            bool has_pixel_shader) const {
+  if (paint_fragment_shader_ == VK_NULL_HANDLE) {
+    return false;
+  }
+  if (!has_pixel_shader) {
+    return IsPaintedWithoutPixelShader(description);
+  }
+  if (android_experiments::IsListedShader(android_paint_shader_hashes_,
+                                          description.vertex_shader_hash,
+                                          description.pixel_shader_hash)) {
+    return true;
+  }
+  // Bit 16: only the scene's own draws, the float24 scene depth bound and a real depth comparison.
+  return IsAndroidExperimentOn(kAndroidExperimentPaintDepthTestedColor) &&
+         IsFloat24DepthBound(description.render_pass_key) &&
+         description.depth_compare_op != xenos::CompareFunction::kAlways;
+}
+
+bool VulkanPipelineCache::NeedsEmptyFragmentShader(const PipelineDescription& description) const {
+  return empty_fragment_shader_ != VK_NULL_HANDLE &&
+         (description.render_pass_key.depth_and_color_used >> 1) != 0;
+}
+
+bool VulkanPipelineCache::CanQueueWithoutPlaceholder() const {
+  return !REXCVAR_GET(vulkan_async_pipeline_placeholders) &&
+         REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty();
+}
+
+bool VulkanPipelineCache::IsPendingWithoutPlaceholder(const Pipeline& pipeline) {
+  return pipeline.is_placeholder.load(std::memory_order_acquire) &&
+         pipeline.pipeline.load(std::memory_order_acquire) == VK_NULL_HANDLE;
+}
+
+void VulkanPipelineCache::QueuePendingPipelineCreation(
+    const PipelineCreationArguments& creation_arguments) {
+  Pipeline& pipeline = creation_arguments.pipeline->second;
+  pipeline.pipeline_layout.store(creation_arguments.pipeline_layout, std::memory_order_release);
+  pipeline.is_placeholder.store(true, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> lock(creation_request_lock_);
+    creation_queue_.push(creation_arguments);
+  }
+  creation_request_cond_.notify_one();
+}
+
+bool VulkanPipelineCache::ReturnPendingPipeline(
+    std::pair<const PipelineDescription, Pipeline>& pipeline, VkPipeline& pipeline_out,
+    const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out) {
+  last_pipeline_ = &pipeline;
+  pipeline_out = VK_NULL_HANDLE;
+  pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
+  if (pipeline_handle_out) {
+    *pipeline_handle_out = &pipeline.second;
+  }
+  return true;
+}
+#endif  // REX_PLATFORM_ANDROID
 
 void VulkanPipelineCache::ProcessDeferredPipelineDestructions(bool force_all) {
   std::vector<VkPipeline> pipelines_to_destroy;
@@ -3648,6 +4224,9 @@ void VulkanPipelineCache::StorageWriteThread() {
     const Shader* shader = nullptr;
     PipelineStoredDescription pipeline_description;
     bool write_pipeline = false;
+#if REX_PLATFORM_ANDROID
+    bool save_pipeline_cache = false;
+#endif
     {
       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
       if (storage_write_thread_shutdown_) {
@@ -3669,12 +4248,26 @@ void VulkanPipelineCache::StorageWriteThread() {
         storage_write_flush_pipelines_ = false;
         flush_pipelines = true;
       }
+#if REX_PLATFORM_ANDROID
+      save_pipeline_cache = storage_write_save_pipeline_cache_;
+      storage_write_save_pipeline_cache_ = false;
+      if (!shader && !write_pipeline && !save_pipeline_cache) {
+        storage_write_request_cond_.wait(lock);
+        continue;
+      }
+#else
       if (!shader && !write_pipeline) {
         storage_write_request_cond_.wait(lock);
         continue;
       }
+#endif
     }
 
+#if REX_PLATFORM_ANDROID
+    if (save_pipeline_cache) {
+      SaveAndroidPipelineCache();
+    }
+#endif
     if (shader) {
       shader_header.ucode_data_hash = shader->ucode_data_hash();
       shader_header.ucode_dword_count = shader->ucode_dword_count();

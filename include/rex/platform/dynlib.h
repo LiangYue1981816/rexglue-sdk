@@ -32,6 +32,8 @@ class DynamicLibrary {
 
   bool Load(const std::filesystem::path& path, SymbolResolution mode = SymbolResolution::kLazy);
   void Close();
+  // Takes ownership of a handle another loader opened (dlopen, android_dlopen_ext, LoadLibrary).
+  void Adopt(void* handle);
   explicit operator bool() const { return handle_ != nullptr; }
 
   void* GetRawSymbol(const char* name) const;

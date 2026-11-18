@@ -20,6 +20,7 @@
 #include <rex/graphics/vulkan/primitive_processor.h>
 #include <rex/logging.h>
 #include <rex/ui/vulkan/util.h>
+#include "pass_timing.h"
 
 REXCVAR_DEFINE_BOOL(vulkan_force_expand_point_sprites_in_vs, false, "GPU/Vulkan",
                     "Force Vulkan point sprite expansion in the vertex shader, even when geometry "
@@ -124,6 +125,7 @@ void VulkanPrimitiveProcessor::BeginSubmission() {
     copy_region->dstOffset = 0;
     copy_region->size = builtin_index_buffer_size_;
 
+    SetBarrierSource(BarrierSource::kIndex);
     command_processor_.PushBufferMemoryBarrier(
         builtin_index_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDEX_READ_BIT);

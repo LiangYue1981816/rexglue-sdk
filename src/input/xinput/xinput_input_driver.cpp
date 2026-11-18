@@ -9,13 +9,17 @@
  * @modified    Sanjay Govind, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "../stick_deadzone.h"
+
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/input/flags.h>
+#include <rex/input/input_system.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 #include <rex/ui/virtual_key.h>
@@ -223,6 +227,20 @@ X_RESULT XinputInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
   out_state->gamepad.thumb_ly = native_state.state.Gamepad.sThumbLY;
   out_state->gamepad.thumb_rx = native_state.state.Gamepad.sThumbRX;
   out_state->gamepad.thumb_ry = native_state.state.Gamepad.sThumbRY;
+
+  auto [dead_rx, dead_ry] = ApplyRightStickDeadzone(
+      static_cast<int16_t>(out_state->gamepad.thumb_rx),
+      static_cast<int16_t>(out_state->gamepad.thumb_ry), REXCVAR_GET(pad_right_stick_deadzone));
+  out_state->gamepad.thumb_rx = dead_rx;
+  out_state->gamepad.thumb_ry = dead_ry;
+
+  const auto& native_pad = native_state.state.Gamepad;
+  if (native_pad.wButtons != 0 || native_pad.bLeftTrigger > 30 || native_pad.bRightTrigger > 30 ||
+      std::abs(static_cast<int>(native_pad.sThumbLX)) > 7849 ||
+      std::abs(static_cast<int>(native_pad.sThumbLY)) > 7849 ||
+      std::abs(static_cast<int>(dead_rx)) > 6000 || std::abs(static_cast<int>(dead_ry)) > 6000) {
+    NotePhysicalPadActivity(2);  // SDL_GAMEPAD_TYPE_XBOX360
+  }
 
   return result;
 }

@@ -100,8 +100,16 @@ target_include_directories(rexcore PRIVATE
 
 if(APPLE)
     target_link_libraries(rexcore PRIVATE pthread)
+elseif(ANDROID)
+    # Bionic has no separate libpthread/librt; libc provides those APIs.
+    # libdl is needed for dlopen/dlsym, libandroid for ASharedMemory_create.
+    target_link_libraries(rexcore PRIVATE dl android log)
 elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
+endif()
+
+if(ANDROID)
+    target_sources(rexcore PRIVATE main_android.cpp)
 endif()
 
 target_link_libraries(rexcore

@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -21,6 +22,7 @@
 #include <fmt/format.h>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/render_target/native_surfaces.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
@@ -186,12 +188,18 @@ class RenderTargetCache {
       : register_file_(register_file),
         draw_extent_estimator_(register_file, memory),
         draw_resolution_scale_x_(draw_resolution_scale_x),
-        draw_resolution_scale_y_(draw_resolution_scale_y) {
+        draw_resolution_scale_y_(draw_resolution_scale_y),
+        edram_tile_count_(GetConfiguredEdramTileCount()) {
     assert_not_zero(draw_resolution_scale_x);
     assert_not_zero(draw_resolution_scale_y);
   }
 
   const RegisterFile& register_file() const { return register_file_; }
+
+  // Size of the EDRAM tile address space tracked by the ownership map and used to wrap render
+  // target ranges: xenos::kEdramVirtualTileCount with gpu_native_surfaces (12-bit render target
+  // bases), xenos::kEdramTileCount otherwise.
+  uint32_t edram_tile_count() const { return edram_tile_count_; }
 
   virtual bool IsGammaFormatHostStorageSeparate() const = 0;
 
@@ -225,15 +233,20 @@ class RenderTargetCache {
   union RenderTargetKey {
     uint32_t key;
     struct {
-      uint32_t base_tiles : xenos::kEdramBaseTilesBits;  // 11
+      // [0, 2047], or [0, 4095] with gpu_native_surfaces (edram_tile_count_).
+      uint32_t base_tiles : xenos::kEdramVirtualBaseTilesBits;  // 12
       // At 4x MSAA (2 horizontal samples), max. align(8192 * 2, 80) / 80 = 205.
       // For pitch at 64bpp, multiply by 2 (or use GetPitchTiles).
-      uint32_t pitch_tiles_at_32bpp : 8;                          // 19
-      xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;  // 21
-      uint32_t is_depth : 1;                                      // 22
+      uint32_t pitch_tiles_at_32bpp : 8;                          // 20
+      xenos::MsaaSamples msaa_samples : xenos::kMsaaSamplesBits;  // 22
+      uint32_t is_depth : 1;                                      // 23
       // Ignoring the blending precision and sRGB.
-      uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 26
+      uint32_t resource_format : xenos::kRenderTargetFormatBits;  // 27
     };
+    static_assert(xenos::kEdramVirtualBaseTilesBits + 8 + xenos::kMsaaSamplesBits + 1 +
+                          xenos::kRenderTargetFormatBits <=
+                      32,
+                  "RenderTargetKey must fit in 32 bits");
 
     RenderTargetKey() : key(0) { static_assert_size(*this, sizeof(key)); }
 
@@ -326,16 +339,18 @@ class RenderTargetCache {
         kMaxRectanglesWithoutCutout * kMaxCutoutBorderRectangles;
     // Cutout can be specified for resolve clears - not to transfer areas that
     // will be cleared to a single value anyway.
+    // edram_tile_count is the size of the ownership address space
+    // (RenderTargetCache::edram_tile_count()).
     static uint32_t GetRangeRectangles(uint32_t start_tiles, uint32_t end_tiles,
-                                       uint32_t base_tiles, uint32_t pitch_tiles,
-                                       xenos::MsaaSamples msaa_samples, bool is_64bpp,
-                                       Rectangle* rectangles_out,
+                                       uint32_t edram_tile_count, uint32_t base_tiles,
+                                       uint32_t pitch_tiles, xenos::MsaaSamples msaa_samples,
+                                       bool is_64bpp, Rectangle* rectangles_out,
                                        const Rectangle* cutout = nullptr);
-    uint32_t GetRectangles(uint32_t base_tiles, uint32_t pitch_tiles,
+    uint32_t GetRectangles(uint32_t edram_tile_count, uint32_t base_tiles, uint32_t pitch_tiles,
                            xenos::MsaaSamples msaa_samples, bool is_64bpp,
                            Rectangle* rectangles_out, const Rectangle* cutout = nullptr) const {
-      return GetRangeRectangles(start_tiles, end_tiles, base_tiles, pitch_tiles, msaa_samples,
-                                is_64bpp, rectangles_out, cutout);
+      return GetRangeRectangles(start_tiles, end_tiles, edram_tile_count, base_tiles, pitch_tiles,
+                                msaa_samples, is_64bpp, rectangles_out, cutout);
     }
     bool AreSourcesSame(const Transfer& other_transfer) const {
       return source == other_transfer.source &&
@@ -515,10 +530,25 @@ class RenderTargetCache {
                                       uint32_t& group_count_x_out,
                                       uint32_t& group_count_y_out) const;
 
+  // ResolveInfo::GetCopyEdramTileSpan in the ownership map's address space: with
+  // gpu_native_surfaces the base includes bit 11 of the render target base (wrapped to
+  // edram_tile_count()), which keeps it congruent modulo xenos::kEdramTileCount to the 11-bit
+  // ResolveEdramInfo::base_tiles that the resolve shaders use. Pass the result to
+  // GetResolveCopyRectanglesToDump / DumpRenderTargets.
+  void GetResolveCopyEdramTileSpan(const draw_util::ResolveInfo& resolve_info, uint32_t& base_out,
+                                   uint32_t& row_length_used_out, uint32_t& rows_out,
+                                   uint32_t& pitch_out) const;
+  // The resolve source's base in the ownership map's address space (see
+  // GetResolveCopyEdramTileSpan) - ResolveEdramInfo::base_tiles of the copy source otherwise.
+  uint32_t GetResolveCopyEdramBaseTiles(const draw_util::ResolveInfo& resolve_info) const;
+
   // Returns mappings between ranges within the specified tile rectangle (not
   // render target texture rectangle - textures may have any pitch they need)
-  // from ResolveInfo::GetCopyEdramTileSpan and render targets owning them to
+  // from GetResolveCopyEdramTileSpan and render targets owning them to
   // rectangles_out.
+  // gpu_native_surfaces: the dump goes to the xenos::kEdramTileCount-tile EDRAM buffer modulo
+  // xenos::kEdramTileCount, so only the first xenos::kEdramTileCount tiles of a longer span are
+  // returned (counted), not to overwrite them with the tiles xenos::kEdramTileCount later.
   void GetResolveCopyRectanglesToDump(uint32_t base, uint32_t row_length, uint32_t rows,
                                       uint32_t pitch,
                                       std::vector<ResolveCopyDumpRectangle>& rectangles_out) const;
@@ -549,11 +579,17 @@ class RenderTargetCache {
   void PixelShaderInterlockFullEdramBarrierPlaced();
 
  private:
+  // xenos::kEdramVirtualTileCount if gpu_native_surfaces is on, xenos::kEdramTileCount otherwise.
+  static uint32_t GetConfiguredEdramTileCount();
+
   const RegisterFile& register_file_;
   uint32_t draw_resolution_scale_x_;
   uint32_t draw_resolution_scale_y_;
 
   DrawExtentEstimator draw_extent_estimator_;
+
+  // Set once at construction, see edram_tile_count(). Power of two.
+  uint32_t edram_tile_count_;
 
   // For host render targets.
 
@@ -648,6 +684,16 @@ class RenderTargetCache {
   void ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,
                        uint32_t length_tiles, std::vector<Transfer>* transfers_append_out,
                        const Transfer::Rectangle* resolve_clear_cutout = nullptr);
+  // gpu_native_surfaces: removes the transfers into dest_key that the mode drops and counts them.
+  void DropNativeSurfaceTransfers(std::vector<Transfer>& transfers,
+                                  const RenderTargetKey& dest_key);
+  // gpu_native_surfaces: removes (and counts) the transfers into dest_key that the transfer and
+  // host depth store shaders can't address. They wrap the source tile index (and the host depth
+  // copy's destination tile index) to xenos::kEdramTileCount, which is only correct if the range
+  // lies within the first xenos::kEdramTileCount tiles of the render target it's read from.
+  void DropNativeWideTransfers(std::vector<Transfer>& transfers, const RenderTargetKey& dest_key);
+  // gpu_native_surfaces: logs the dropped transfer counts every few seconds.
+  void ReportNativeSurfaceDrops();
 
   // If failed to create, may contain nullptr to prevent attempting to create a
   // render target twice.
@@ -684,6 +730,17 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+
+  // gpu_native_surfaces: ownership transfers dropped since the last report.
+  native_surfaces::DropCounters native_surface_drops_;
+  // gpu_native_surfaces: transfers dropped by DropNativeWideTransfers, and resolve dump spans
+  // clamped to xenos::kEdramTileCount tiles (per GetResolveCopyRectanglesToDump call), since the
+  // last report.
+  uint64_t native_wide_transfer_drops_ = 0;
+  uint64_t native_wide_transfer_drop_tiles_ = 0;
+  mutable uint64_t native_wide_resolve_span_clamps_ = 0;
+  std::chrono::steady_clock::time_point native_surface_drops_last_report_ =
+      std::chrono::steady_clock::now();
 };
 
 }  // namespace rex::graphics

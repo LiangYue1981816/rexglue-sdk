@@ -14,5 +14,7 @@
 
 // Input/HID configuration flags
 REXCVAR_DECLARE(bool, guide_button);
+REXCVAR_DECLARE(bool, xam_input_block);
 REXCVAR_DECLARE(std::string, hid_mappings_file);
 REXCVAR_DECLARE(std::string, input_backend);
+REXCVAR_DECLARE(uint32_t, input_pad_first_user);

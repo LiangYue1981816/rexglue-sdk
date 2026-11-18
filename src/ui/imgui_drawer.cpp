@@ -86,6 +86,13 @@ void ApplyDefaultStyle(ImGuiStyle& style) {
   style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
 }
 
+#if REX_PLATFORM_ANDROID
+bool AnyDialogWantsContinuousPaint(const std::vector<ImGuiDialog*>& dialogs) {
+  return std::any_of(dialogs.cbegin(), dialogs.cend(),
+                     [](const ImGuiDialog* dialog) { return dialog->WantsContinuousPaint(); });
+}
+#endif
+
 }  // namespace
 
 ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup,
@@ -423,6 +430,7 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   ImGui::Render();
   ImDrawData* draw_data = ImGui::GetDrawData();
+  [[maybe_unused]] const bool drew_something = draw_data && draw_data->TotalVtxCount > 0;
   if (draw_data) {
     RenderDrawLists(draw_data, ui_draw_context);
   }
@@ -431,6 +439,9 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     reset_mouse_position_after_next_frame_ = false;
     io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
   }
+#if REX_PLATFORM_ANDROID
+  ReleaseDeferredTouch(io);
+#endif
 
   // Detaching is deferred if the last dialog is removed during drawing, perform
   // it now if needed.
@@ -439,7 +450,15 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   if (!dialogs_.empty()) {
     // Repaint (and handle input) continuously if still active. In detached mode
     // there is no presenter; the app drives repaint via its own present loop.
-    if (presenter_) {
+    // Elsewhere than Android, "active" is "drew something this frame": a dialog that only waits (a
+    // closed menu, an empty notification queue) would otherwise make the presenter repaint at the
+    // display rate and show every guest frame an uneven number of times. Decided here so the
+    // ImGuiDialog interface (and the vtable the game's dialogs are built against) stays as it is.
+#if REX_PLATFORM_ANDROID
+    if (presenter_ && AnyDialogWantsContinuousPaint(dialogs_)) {
+#else
+    if (presenter_ && drew_something) {
+#endif
       presenter_->RequestUIPaintFromUIThread();
     }
   }
@@ -591,6 +610,15 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
     }
   }
   UpdateMousePosition(e.x(), e.y());
+#if REX_PLATFORM_ANDROID
+  if (action == TouchEvent::Action::kDown) {
+    touch_press_unseen_ = true;
+    touch_release_deferred_ = false;
+  } else if (action != TouchEvent::Action::kMove && touch_press_unseen_) {
+    touch_release_deferred_ = true;
+    return;
+  }
+#endif
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
     io.MouseDown[0] = false;
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
@@ -613,7 +641,24 @@ void ImGuiDrawer::ClearInput() {
   io.ClearInputKeys();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
+#if REX_PLATFORM_ANDROID
+  touch_press_unseen_ = false;
+  touch_release_deferred_ = false;
+#endif
 }
+
+#if REX_PLATFORM_ANDROID
+void ImGuiDrawer::ReleaseDeferredTouch(ImGuiIO& io) {
+  touch_press_unseen_ = false;
+  if (!touch_release_deferred_) {
+    return;
+  }
+  touch_release_deferred_ = false;
+  io.MouseDown[0] = false;
+  touch_pointer_id_ = TouchEvent::kPointerIDNone;
+  reset_mouse_position_after_next_frame_ = true;
+}
+#endif
 
 void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
   auto& io = GetIO();

@@ -17,6 +17,8 @@ set(REXSYSTEM_SOURCES
     xnotifylistener.cpp
     xenumerator.cpp
     xsocket.cpp
+    system_link.cpp
+    system_link_settings.cpp
     xsymboliclink.cpp
     xobject.cpp
     xmodule.cpp

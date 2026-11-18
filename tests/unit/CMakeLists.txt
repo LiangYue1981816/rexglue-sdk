@@ -4,8 +4,12 @@ add_executable(unit_tests
     test_memory.cpp
     memory/heap_allocation_test.cpp
     kernel/object_table_test.cpp
+    kernel/xsession_test.cpp
+    kernel/host_ui_route_test.cpp
     core/cvar_test.cpp
     core/fiber_test.cpp
+    core/wait_test.cpp
+    core/timer_queue_test.cpp
     core/filesystem_test.cpp
     core/vfs_overwrite_test.cpp
     core/hash_test.cpp
@@ -14,12 +18,17 @@ add_executable(unit_tests
     ppc/import_function_test.cpp
     ppc/stack_test.cpp
     system/guest_path_test.cpp
+    system/system_link_test.cpp
     system/achievement_manager_test.cpp
     system/function_dispatcher_test.cpp
     input/input_assignment_test.cpp
     codegen/codegen_writer_test.cpp
     codegen/output_partition_test.cpp
     codegen/output_stamp_test.cpp
+    ppc/fpscr_rounding_test.cpp
+    graphics/android_draw_experiments_test.cpp
+    graphics/pipeline_cache_file_test.cpp
+    graphics/render_area_test.cpp
 )
 
 target_sources(unit_tests PRIVATE

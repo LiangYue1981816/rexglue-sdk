@@ -27,6 +27,10 @@
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
+#include <rex/graphics/vulkan/android_gpu_stats.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/graphics/vulkan/android_draw_experiments.h>
+#endif
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
@@ -143,6 +147,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
+#if REX_PLATFORM_ANDROID
+  // The render target cache adds FRAMETRACE-RT lines to the traced frame, numbered by the next
+  // draw.
+  bool IsAndroidFrameTraceActive() const { return android_frame_trace_active_; }
+  uint32_t android_frame_draw_index() const { return android_frame_draw_index_; }
+#endif
+
   // Returns the deferred drawing command list for the currently open
   // submission.
   DeferredCommandBuffer& deferred_command_buffer() {
@@ -190,6 +201,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Returns whether any barriers have been submitted - if true is returned, the
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
+#if REX_PLATFORM_ANDROID
+  void CountAndroidSharedMemoryUpload(uint64_t bytes);
+#endif
 
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
@@ -417,6 +431,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
   bool AwaitAllQueueOperationsCompletion() {
+    REX_ANDROID_GPU_STAT(++android_gpu_stats_.queue_drains);
     CheckSubmissionFenceAndDeviceLoss(GetCurrentSubmission());
     return !submission_open_ && submissions_in_flight_fences_.empty();
   }
@@ -440,6 +455,52 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
+#if REX_PLATFORM_ANDROID
+  VkQueryControlFlags GetAndroidOcclusionQueryControlFlags() const;
+  void RecordAndroidDrawStats(
+      const VulkanShader* pixel_shader, uint32_t normalized_color_mask,
+      reg::RB_DEPTHCONTROL normalized_depth_control,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result);
+  void RecordAndroidClipStats(const VulkanShader& vertex_shader, bool writes_color);
+  void CountAndroidTextureSets(bool stage_has_bindings, bool set_written);
+  void RecordAndroidOcclusionResult(uint64_t samples);
+  void LoadAndroidDrawSkipLists();
+  void ResolveAndroidColorDepthBias();
+  void StartAndroidFrameDrawNumbering();
+  android_experiments::DrawFacts GetAndroidDrawFacts(
+      const VulkanShader& vertex_shader, const VulkanShader* pixel_shader,
+      const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+      reg::RB_DEPTHCONTROL normalized_depth_control) const;
+  android_experiments::SkipReason NumberAndroidDraw(const android_experiments::DrawFacts& draw);
+  float GetAndroidColorDepthBias(const android_experiments::DrawFacts& draw,
+                                 uint32_t normalized_color_mask) const;
+  void CountAndroidMemexportDraw(bool memexport_writes_possible);
+  void ApplyAndroidScissorExperiment(VkRect2D& scissor_rect) const;
+  void UpdateAndroidFrameTrace();
+  std::string DescribeAndroidVertexBindings(const VulkanShader& vertex_shader) const;
+  std::string DescribeAndroidFirstVertex(const VulkanShader& vertex_shader) const;
+  std::string DescribeAndroidRenderTargets(uint32_t normalized_color_mask) const;
+  std::string DescribeAndroidRasterState() const;
+  std::string DescribeAndroidRectangleVertices(const VulkanShader& vertex_shader) const;
+  void TraceAndroidDraw(const VulkanShader& vertex_shader, const VulkanShader* pixel_shader,
+                        const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                        reg::RB_DEPTHCONTROL normalized_depth_control,
+                        uint32_t normalized_color_mask, uint32_t frame_draw_index,
+                        android_experiments::SkipReason skip_reason);
+  int64_t android_frame_trace_start_us_ = 0;
+  bool android_frame_trace_active_ = false;
+  bool android_frame_trace_done_ = false;
+  uint32_t android_frame_trace_draws_ = 0;
+  // Draws of the current frame that reached the pipeline; numbers FRAMETRACE and draw ranges.
+  uint32_t android_frame_draw_index_ = 0;
+  bool android_frame_saw_prepass_mesh_ = false;
+  float android_draw_depth_bias_ = 0.0f;
+  // vulkan_android_color_depth_bias resolved once for this GPU vendor.
+  float android_color_depth_bias_ = 0.0f;
+  android_experiments::DrawSkipLists android_draw_skip_lists_;
+  void StartAndroidGpuStatsWindow(int64_t now_us);
+  void LogAndroidGpuStatsIfDue();
+#endif
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -507,6 +568,12 @@ class VulkanCommandProcessor : public CommandProcessor {
                                          const VkDescriptorImageInfo* texture_image_info,
                                          const VkDescriptorImageInfo* sampler_image_info,
                                          VkWriteDescriptorSet* descriptor_set_writes_out);
+  void AppendTextureImageInfos(const std::vector<VulkanShader::TextureBinding>& textures);
+  void AppendSamplerImageInfos(
+      const std::vector<std::pair<VulkanTextureCache::SamplerParameters, VkSampler>>& samplers);
+  void KeepTextureSetIfUnchanged(size_t stage, uint32_t descriptor_set, uint32_t texture_count,
+                                 size_t begin, size_t end);
+  void RememberWrittenTextureSet(size_t stage, uint32_t texture_count, size_t begin, size_t end);
 
   bool device_lost_ = false;
 
@@ -566,6 +633,11 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Temporary storage with reusable memory for writing image and sampler
   // descriptors.
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
+  // What the texture descriptor sets last written in this frame hold, vertex [0] and pixel [1]: a
+  // draw with the same textures and samplers keeps the set instead of writing a new one.
+  std::vector<VkDescriptorImageInfo> written_texture_image_infos_[2];
+  uint32_t written_texture_counts_[2] = {};
+  uint64_t written_texture_destroyed_binding_counts_[2] = {};
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
 
@@ -741,6 +813,9 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+#if REX_PLATFORM_ANDROID
+  AndroidGpuStats android_gpu_stats_;
+#endif
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

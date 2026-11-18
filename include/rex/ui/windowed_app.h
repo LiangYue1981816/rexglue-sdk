@@ -24,10 +24,8 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
-#endif
+// Android, like the desktop, runs one app per library through SDL_main
+// (windowed_app_main_sdl.cpp), so XE_UI_WINDOWED_APPS_IN_LIBRARY stays off there too.
 
 namespace rex {
 namespace ui {

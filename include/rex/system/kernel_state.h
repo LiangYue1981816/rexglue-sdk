@@ -199,7 +199,18 @@ class KernelState {
 
   xam::AppManager* app_manager() const { return app_manager_.get(); }
   xam::ContentManager* content_manager() const { return content_manager_.get(); }
+  // Profile 0 is the primary local player.
   xam::UserProfile* user_profile() const { return user_profile_.get(); }
+  // Profile of local player `user_index`, or nullptr when no player is signed in at that index.
+  xam::UserProfile* user_profile(uint32_t user_index) const {
+    if (user_index == 0) return user_profile_.get();
+    return user_index < local_user_count() ? extra_user_profiles_[user_index - 1].get() : nullptr;
+  }
+  uint32_t local_user_count() const {
+    return 1 + static_cast<uint32_t>(extra_user_profiles_.size());
+  }
+  // One bit per signed-in local user (bit N = user index N), as XN_SYS_SIGNINCHANGED carries it.
+  uint32_t signed_in_user_mask() const { return (1u << local_user_count()) - 1; }
 
   // Access must be guarded by the global critical region.
   util::ObjectTable* object_table() { return &object_table_; }
@@ -395,6 +406,10 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+
+  // Players 2-4 (split-screen). Last, so the members before keep their offsets for games built
+  // against the unpatched SDK headers (their inline accessors read KernelState directly).
+  std::vector<std::unique_ptr<xam::UserProfile>> extra_user_profiles_;
 
   friend class XObject;
 };

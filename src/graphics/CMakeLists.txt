@@ -80,8 +80,14 @@ if(REXGLUE_USE_D3D12)
         d3d12/shader.cpp
         d3d12/shared_memory.cpp
         d3d12/texture_cache.cpp
+        d3d12/texture_replacement.cpp
         d3d12/deferred_command_list.cpp
         d3d12/pipeline_cache.cpp
+        d3d12/gow2_temporal.cpp
+        d3d12/gow2_dlss.cpp
+        d3d12/gow2_upscale.cpp
+        d3d12/gow2_fsr.cpp
+        d3d12/gow2_framegen.cpp
     )
 endif()
 
@@ -111,6 +117,35 @@ target_include_directories(rexgpu-xenos PRIVATE
 )
 
 target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
+
+option(GOW2_DEV_TOOLS "Frame tracing, dumps and a D3D12 debug-layer switch (development only)" OFF)
+if(GOW2_DEV_TOOLS)
+    target_compile_definitions(rexgpu-xenos PRIVATE GOW2_DEV_TOOLS=1)
+endif()
+
+# Optional AMD FidelityFX upscaler (FSR) support: public API headers only (loaded at run time).
+set(GOW2_FFX_SDK "${REXGLUE_ROOT}/../ffx-sdk/Kits/FidelityFX" CACHE PATH "AMD FidelityFX SDK Kits/FidelityFX folder")
+if(WIN32 AND EXISTS "${GOW2_FFX_SDK}/api/include/ffx_api.h")
+    target_include_directories(rexgpu-xenos PRIVATE "${GOW2_FFX_SDK}/api/include"
+                               "${GOW2_FFX_SDK}/upscalers/include"
+                               "${GOW2_FFX_SDK}/framegeneration/include")
+    target_compile_definitions(rexgpu-xenos PRIVATE GOW2_HAS_FFX=1)
+    message(STATUS "FSR (FidelityFX API) support: ON (${GOW2_FFX_SDK})")
+else()
+    message(STATUS "FSR (FidelityFX API) support: OFF")
+endif()
+
+# Optional NVIDIA DLSS (NGX) support: headers and import library come from the public NVIDIA/DLSS
+# repository checked out next to this tree. Nothing from NVIDIA ends up in the source tree.
+set(GOW2_DLSS_SDK "${REXGLUE_ROOT}/../dlss-sdk" CACHE PATH "NVIDIA DLSS SDK folder")
+if(WIN32 AND EXISTS "${GOW2_DLSS_SDK}/include/nvsdk_ngx.h")
+    target_include_directories(rexgpu-xenos PRIVATE "${GOW2_DLSS_SDK}/include")
+    target_link_libraries(rexgpu-xenos PRIVATE "${GOW2_DLSS_SDK}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib")
+    target_compile_definitions(rexgpu-xenos PRIVATE GOW2_HAS_DLSS=1)
+    message(STATUS "DLSS (NGX) support: ON (${GOW2_DLSS_SDK})")
+else()
+    message(STATUS "DLSS (NGX) support: OFF")
+endif()
 
 rex_target_pch(rexgpu-xenos
     <mutex>

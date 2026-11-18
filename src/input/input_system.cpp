@@ -10,8 +10,11 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <mutex>
 
+#include <rex/chrono/clock.h>
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
 #include <rex/input/flags.h>
@@ -28,6 +31,15 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_DOUBLE(pad_right_stick_deadzone, 0.0, "Input",
+                      "Radial dead zone for the right stick of physical controllers, 0 to 0.9. "
+                      "Set by games that turn off their own look dead zone so stick noise does "
+                      "not move the camera.");
+REXCVAR_DEFINE_UINT32(input_pad_first_user, 0, "Input",
+                      "First guest user that real controllers are assigned to (1 = keyboard and "
+                      "mouse play as player 1 and the first controller as player 2, for "
+                      "split-screen).")
+    .range(0, 3);
 namespace rex::input {
 
 namespace {
@@ -36,6 +48,22 @@ namespace {
 // a real pad off guest user 0. SlotAssignment routes them by their synthetic
 // flag and never reads this value.
 constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
+
+#if REX_PLATFORM_LINUX
+// The guest polls input from several XThreads at once, and every GetState, GetCapabilities,
+// SetState and GetKeystroke rebuilds devices_ in RefreshDevices. Unserialized, two threads resize
+// and free the same vectors (the heap corruption the gow2 port's Windows XamInput guard stops by
+// serializing the guest's XamInput calls). Android and Linux have no such guard, so one recursive lock is
+// held across every InputSystem entry point that reads or rebuilds the device list.
+std::recursive_mutex& InputSystemLock() {
+  static std::recursive_mutex lock;
+  return lock;
+}
+#define REX_INPUT_SYSTEM_LOCK() \
+  std::lock_guard<std::recursive_mutex> input_system_lock(InputSystemLock())
+#else
+#define REX_INPUT_SYSTEM_LOCK() ((void)0)
+#endif
 
 }  // namespace
 
@@ -48,6 +76,7 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  REX_INPUT_SYSTEM_LOCK();
   // device_owners_ holds raw driver pointers.
   devices_.clear();
   device_owners_.clear();
@@ -55,6 +84,7 @@ void InputSystem::Shutdown() {
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  REX_INPUT_SYSTEM_LOCK();
   drivers_.push_back(std::move(driver));
 }
 
@@ -72,6 +102,7 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
 }
 
 void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
+  REX_INPUT_SYSTEM_LOCK();
   assignment_ = std::move(assignment);
   if (assignment_) {
     assignment_->OnDevicesChanged(devices_);
@@ -79,6 +110,7 @@ void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignme
 }
 
 void InputSystem::RefreshDevices() {
+  REX_INPUT_SYSTEM_LOCK();
   std::vector<DeviceInfo> seen;
   std::vector<InputDriver*> owners;
   std::vector<DeviceInfo> enumerated;
@@ -186,6 +218,7 @@ const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
 
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
+  REX_INPUT_SYSTEM_LOCK();
   SCOPE_profile_cpu_f("hid");
   if (!out_caps || !assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -213,6 +246,7 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+  REX_INPUT_SYSTEM_LOCK();
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -252,6 +286,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 }
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+  REX_INPUT_SYSTEM_LOCK();
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -294,6 +329,7 @@ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
+  REX_INPUT_SYSTEM_LOCK();
   SCOPE_profile_cpu_f("hid");
   if (!assignment_) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
@@ -355,4 +391,36 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   return input;
 }
 
+// File-static rather than InputDriver members: gow2.exe subclasses InputDriver against the
+// unpatched headers, so the class layout and vtable must not change.
+static std::atomic<uint64_t> last_physical_pad_activity_ms{0};
+static std::atomic<int> last_physical_pad_type{0};
+
+void NotePhysicalPadActivity(int sdl_gamepad_type) {
+  last_physical_pad_type.store(sdl_gamepad_type, std::memory_order_relaxed);
+  last_physical_pad_activity_ms.store(rex::chrono::Clock::QueryHostUptimeMillis(),
+                                      std::memory_order_relaxed);
+}
+
+void NotePhysicalPadType(int sdl_gamepad_type) {
+  last_physical_pad_type.store(sdl_gamepad_type, std::memory_order_relaxed);
+}
+
+uint64_t LastPhysicalPadActivity(int* out_sdl_gamepad_type) {
+  if (out_sdl_gamepad_type) {
+    *out_sdl_gamepad_type = last_physical_pad_type.load(std::memory_order_relaxed);
+  }
+  return last_physical_pad_activity_ms.load(std::memory_order_relaxed);
+}
+
 }  // namespace rex::input
+
+#if defined(_WIN32)
+#define REX_INPUT_EXPORT __declspec(dllexport)
+#else
+#define REX_INPUT_EXPORT __attribute__((visibility("default")))
+#endif
+
+extern "C" REX_INPUT_EXPORT uint64_t rex_input_get_last_physical_activity(int* out_type) {
+  return rex::input::LastPhysicalPadActivity(out_type);
+}

@@ -10,6 +10,7 @@
  */
 
 #include <rex/input/input.h>
+#include <rex/input/flags.h>
 #include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
@@ -20,6 +21,10 @@
 #include <rex/system/xtypes.h>
 
 #pragma GCC diagnostic ignored "-Wunused-parameter"
+
+REXCVAR_DEFINE_BOOL(xam_input_block, false, "Input",
+                    "Host UI open: the game reads a neutral pad and no keystrokes, and the "
+                    "keyboard/mouse driver releases the mouse");
 
 namespace rex {
 namespace kernel {
@@ -112,7 +117,11 @@ u32 XamInputGetState_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_STATE> i
   }
 
   auto* is = input_system();
-  return is->GetState(actual_user_index, input_state);
+  auto result = is->GetState(actual_user_index, input_state);
+  if (REXCVAR_GET(xam_input_block) && result == X_ERROR_SUCCESS && input_state) {
+    input_state->gamepad = {};
+  }
+  return result;
 }
 
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
@@ -138,11 +147,11 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   // user index = index or XUSER_INDEX_ANY
   // flags = XINPUT_FLAG_GAMEPAD (| _ANYUSER | _ANYDEVICE)
 
-  if (!keystroke) {
+  if (!keystroke && !REXCVAR_GET(xam_input_block)) {
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
+  if (!REXCVAR_GET(xam_input_block) && (flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
     // Ignore any query for other types of devices.
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -154,17 +163,26 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
   }
 
   auto* is = input_system();
-  return is->GetKeystroke(actual_user_index, flags, keystroke);
+  X_INPUT_KEYSTROKE discarded = {};
+  auto result = is->GetKeystroke(actual_user_index, flags,
+                               keystroke ? keystroke.host_address() : &discarded);
+  if (REXCVAR_GET(xam_input_block)) {
+    if (keystroke) {
+      *keystroke = {};
+    }
+    return X_ERROR_EMPTY;
+  }
+  return result;
 }
 
 // Same as non-ex, just takes a pointer to user index.
 u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
                                  ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
-  if (!keystroke) {
+  if (!keystroke && !REXCVAR_GET(xam_input_block)) {
     return X_ERROR_BAD_ARGUMENTS;
   }
 
-  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
+  if (!REXCVAR_GET(xam_input_block) && (flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
     // Ignore any query for other types of devices.
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
@@ -176,7 +194,15 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   }
 
   auto* is = input_system();
-  auto result = is->GetKeystroke(user_index, flags, keystroke);
+  X_INPUT_KEYSTROKE discarded = {};
+  auto result = is->GetKeystroke(user_index, flags,
+                               keystroke ? keystroke.host_address() : &discarded);
+  if (REXCVAR_GET(xam_input_block)) {
+    if (keystroke) {
+      *keystroke = {};
+    }
+    return X_ERROR_EMPTY;
+  }
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;
   }
@@ -188,7 +214,7 @@ i32 XamUserGetDeviceContext_entry(u32 user_index, u32 unk, mapped_u32 out_ptr) {
   // If this function fails they assume zero, so let's fail AND
   // set zero just to be safe.
   *out_ptr = 0;
-  if (!user_index || (user_index & 0xFF) == 0xFF) {
+  if (REX_KERNEL_STATE()->user_profile(user_index) || (user_index & 0xFF) == 0xFF) {
     return X_E_SUCCESS;
   } else {
     return X_E_DEVICE_NOT_CONNECTED;

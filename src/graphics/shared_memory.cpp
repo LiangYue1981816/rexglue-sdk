@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -19,6 +20,21 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+#include <rex/platform.h>
+
+// Each upload is a copy that ends the render pass on a tiling GPU: on the Adreno 830 this halves the passes
+// (55 to 26 a frame) and saves 7 % of the GPU megacycles per frame in the hospital.
+#if REX_PLATFORM_ANDROID
+REXCVAR_DEFINE_BOOL(gpu_upload_whole_blocks, true, "GPU",
+                    "When a draw needs guest memory copied to the GPU, also copy the rest of each 256 KB block "
+                    "it touches that the GPU used before and the CPU has written since, so the draws that "
+                    "follow need no copy (and on tiling GPUs no render pass break) of their own");
+#else
+REXCVAR_DEFINE_BOOL(gpu_upload_whole_blocks, false, "GPU",
+                    "When a draw needs guest memory copied to the GPU, also copy the rest of each 256 KB block "
+                    "it touches that the GPU used before and the CPU has written since, so the draws that "
+                    "follow need no copy (and on tiling GPUs no render pass break) of their own");
+#endif
 
 namespace rex::graphics {
 
@@ -34,6 +50,7 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  system_page_flags_uploaded_.assign(num_system_page_flags_, 0);
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -272,6 +289,34 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
   MakeRangeValid(start, length, true);
 }
 
+bool SharedMemory::IsRangeGpuWritten(uint32_t start, uint32_t length) {
+  if (length == 0 || start >= kBufferSize) {
+    return false;
+  }
+  length = std::min(length, kBufferSize - start);
+  uint32_t page_first = start >> page_size_log2_;
+  uint32_t page_last = (start + length - 1) >> page_size_log2_;
+  auto global_lock = global_critical_region_.Acquire();
+  uint32_t page = page_first;
+  while (page <= page_last) {
+    uint32_t block = page >> 6;
+    uint32_t block_last_page = std::min(page_last, ((block + 1) << 6) - 1);
+    uint32_t first_bit = page & 63;
+    uint32_t last_bit = block_last_page & 63;
+    uint64_t mask;
+    if (first_bit == 0 && last_bit == 63) {
+      mask = ~uint64_t(0);
+    } else {
+      mask = ((uint64_t(1) << (last_bit - first_bit + 1)) - 1) << first_bit;
+    }
+    if ((system_page_flags_valid_and_gpu_written_[block] & mask) != 0) {
+      return true;
+    }
+    page = block_last_page + 1;
+  }
+  return false;
+}
+
 bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                     uint32_t length_allocations) {
   assert_always(
@@ -303,6 +348,9 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
       system_page_flags_valid_[i] |= valid_bits;
+      if (!written_by_gpu) {
+        system_page_flags_uploaded_[i] |= valid_bits;
+      }
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
     }
@@ -343,8 +391,8 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
-  merged_ranges.reserve(count);
+  std::vector<std::pair<uint32_t, uint32_t>>& merged_ranges = request_ranges_;
+  merged_ranges.clear();
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
     uint32_t length = ranges[i].second;
@@ -465,13 +513,65 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     return true;
   }
 
+  if (REXCVAR_GET(gpu_upload_whole_blocks)) {
+    AppendStaleUploadedPagesInBlocks();
+  }
   return UploadRanges(upload_ranges_);
+}
+
+void SharedMemory::AppendStaleUploadedPagesInBlocks() {
+  std::vector<uint32_t> blocks;
+  for (const auto& range : upload_ranges_) {
+    for (uint32_t block = range.first >> 6; block <= (range.first + range.second - 1) >> 6; ++block) {
+      if (blocks.empty() || blocks.back() != block) {
+        blocks.push_back(block);
+      }
+    }
+  }
+  std::vector<std::pair<uint32_t, uint32_t>> requested;
+  requested.swap(upload_ranges_);
+  auto global_lock = global_critical_region_.Acquire();
+  for (uint32_t block : blocks) {
+    uint64_t pending = system_page_flags_uploaded_[block] & ~system_page_flags_valid_[block];
+    // The requested pages of this block, which may never have been uploaded.
+    for (const auto& range : requested) {
+      uint32_t first = std::max(range.first, block << 6);
+      uint32_t end = std::min(range.first + range.second, (block + 1) << 6);
+      for (uint32_t page = first; page < end; ++page) {
+        pending |= uint64_t(1) << (page & 63);
+      }
+    }
+    uint32_t bit;
+    while (rex::bit_scan_forward(pending, &bit)) {
+      uint64_t from_bit = pending >> bit;
+      uint32_t run = ~from_bit ? uint32_t(rex::tzcnt(~from_bit)) : 64 - bit;
+      uint32_t page_start = (block << 6) + bit;
+      if (!upload_ranges_.empty() &&
+          upload_ranges_.back().first + upload_ranges_.back().second == page_start) {
+        upload_ranges_.back().second += run;
+      } else {
+        upload_ranges_.emplace_back(page_start, run);
+      }
+      pending = (bit + run >= 64) ? 0 : pending & ~((uint64_t(1) << (bit + run)) - 1);
+    }
+  }
 }
 
 bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
   std::pair<uint32_t, uint32_t> range(start, length);
   return RequestRanges(&range, 1);
 }
+
+#if REX_PLATFORM_ANDROID
+SharedMemory::AndroidInvalidationStats SharedMemory::TakeAndroidInvalidationStats() {
+  AndroidInvalidationStats stats;
+  stats.callbacks = android_invalidation_callbacks_.exchange(0, std::memory_order_relaxed);
+  stats.bytes = android_invalidated_bytes_.exchange(0, std::memory_order_relaxed);
+  stats.newly_invalidated_pages =
+      android_newly_invalidated_pages_.exchange(0, std::memory_order_relaxed);
+  return stats;
+}
+#endif
 
 std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallbackThunk(
     void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range) {
@@ -524,9 +624,19 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
     if (i == block_last && (page_last & 63) != 63) {
       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
     }
+#if REX_PLATFORM_ANDROID
+    android_newly_invalidated_pages_.fetch_add(
+        rex::bit_count(system_page_flags_valid_[i] & invalidate_bits), std::memory_order_relaxed);
+#endif
     system_page_flags_valid_[i] &= ~invalidate_bits;
     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
   }
+
+#if REX_PLATFORM_ANDROID
+  android_invalidation_callbacks_.fetch_add(1, std::memory_order_relaxed);
+  android_invalidated_bytes_.fetch_add(uint64_t(page_last - page_first + 1) << page_size_log2_,
+                                       std::memory_order_relaxed);
+#endif
 
   FireWatches(page_first, page_last, false);
 

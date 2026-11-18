@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include "performance_stats.h"
+
 #include <algorithm>
 #include <array>
 #include <cfloat>
@@ -22,6 +24,8 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/d3d12/texture_cache.h>
+
+#include "texture_replacement.h"
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -36,6 +40,8 @@ namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+#include "../shaders/bytecode/d3d12_5_1/native_hook_desaturate_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/native_resolve_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_cs.h"
@@ -591,6 +597,107 @@ bool D3D12TextureCache::Initialize() {
     }
   }
 
+  // gpu_native_resolves: the resolve writes that are not plain copies. Native resolves of those
+  // fall back to reloading from memory if this fails.
+  if (REXCVAR_GET(gpu_native_resolves)) {
+    D3D12_ROOT_PARAMETER native_resolve_root_parameters[3];
+    native_resolve_root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    native_resolve_root_parameters[0].Constants.ShaderRegister = 0;
+    native_resolve_root_parameters[0].Constants.RegisterSpace = 0;
+    native_resolve_root_parameters[0].Constants.Num32BitValues =
+        sizeof(NativeResolveConstants) / sizeof(uint32_t);
+    native_resolve_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_DESCRIPTOR_RANGE native_resolve_source_range;
+    native_resolve_source_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    native_resolve_source_range.NumDescriptors = 1;
+    native_resolve_source_range.BaseShaderRegister = 0;
+    native_resolve_source_range.RegisterSpace = 0;
+    native_resolve_source_range.OffsetInDescriptorsFromTableStart = 0;
+    native_resolve_root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    native_resolve_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    native_resolve_root_parameters[1].DescriptorTable.pDescriptorRanges =
+        &native_resolve_source_range;
+    native_resolve_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_DESCRIPTOR_RANGE native_resolve_dest_range;
+    native_resolve_dest_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    native_resolve_dest_range.NumDescriptors = 1;
+    native_resolve_dest_range.BaseShaderRegister = 0;
+    native_resolve_dest_range.RegisterSpace = 0;
+    native_resolve_dest_range.OffsetInDescriptorsFromTableStart = 0;
+    native_resolve_root_parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    native_resolve_root_parameters[2].DescriptorTable.NumDescriptorRanges = 1;
+    native_resolve_root_parameters[2].DescriptorTable.pDescriptorRanges = &native_resolve_dest_range;
+    native_resolve_root_parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    D3D12_ROOT_SIGNATURE_DESC native_resolve_root_signature_desc;
+    native_resolve_root_signature_desc.NumParameters =
+        UINT(rex::countof(native_resolve_root_parameters));
+    native_resolve_root_signature_desc.pParameters = native_resolve_root_parameters;
+    native_resolve_root_signature_desc.NumStaticSamplers = 0;
+    native_resolve_root_signature_desc.pStaticSamplers = nullptr;
+    native_resolve_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+    *(native_resolve_root_signature_.ReleaseAndGetAddressOf()) =
+        ui::d3d12::util::CreateRootSignature(provider, native_resolve_root_signature_desc);
+    if (native_resolve_root_signature_) {
+      *(native_resolve_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+          device, shaders::native_resolve_cs, sizeof(shaders::native_resolve_cs),
+          native_resolve_root_signature_.Get());
+    }
+    if (!native_resolve_root_signature_ || !native_resolve_pipeline_) {
+      native_resolve_pipeline_.Reset();
+      native_resolve_root_signature_.Reset();
+      REXGPU_WARN("D3D12TextureCache: Failed to create the native resolve pipeline");
+    }
+  }
+  // gpu_native_hook_example: the example effect of ApplyNativeResolveHooks, skipped if this fails.
+  // native_hook_desaturate_cs loads from a typed R16G16B16A16_FLOAT UAV.
+  if (REXCVAR_GET(gpu_native_resolves) && REXCVAR_GET(gpu_native_hook_example)) {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT hook_format_support = {DXGI_FORMAT_R16G16B16A16_FLOAT};
+    if (FAILED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &hook_format_support,
+                                           sizeof(hook_format_support))) ||
+        !(hook_format_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD)) {
+      REXGPU_WARN(
+          "D3D12TextureCache: R16G16B16A16_FLOAT typed UAV loads not supported, "
+          "gpu_native_hook_example disabled");
+    } else {
+      D3D12_ROOT_PARAMETER hook_root_parameters[2];
+      hook_root_parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+      hook_root_parameters[0].Constants.ShaderRegister = 0;
+      hook_root_parameters[0].Constants.RegisterSpace = 0;
+      hook_root_parameters[0].Constants.Num32BitValues =
+          sizeof(NativeHookDesaturateConstants) / sizeof(uint32_t);
+      hook_root_parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_DESCRIPTOR_RANGE hook_texture_range;
+      hook_texture_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+      hook_texture_range.NumDescriptors = 1;
+      hook_texture_range.BaseShaderRegister = 0;
+      hook_texture_range.RegisterSpace = 0;
+      hook_texture_range.OffsetInDescriptorsFromTableStart = 0;
+      hook_root_parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+      hook_root_parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+      hook_root_parameters[1].DescriptorTable.pDescriptorRanges = &hook_texture_range;
+      hook_root_parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+      D3D12_ROOT_SIGNATURE_DESC hook_root_signature_desc;
+      hook_root_signature_desc.NumParameters = UINT(rex::countof(hook_root_parameters));
+      hook_root_signature_desc.pParameters = hook_root_parameters;
+      hook_root_signature_desc.NumStaticSamplers = 0;
+      hook_root_signature_desc.pStaticSamplers = nullptr;
+      hook_root_signature_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+      *(native_hook_desaturate_root_signature_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateRootSignature(provider, hook_root_signature_desc);
+      if (native_hook_desaturate_root_signature_) {
+        *(native_hook_desaturate_pipeline_.ReleaseAndGetAddressOf()) =
+            ui::d3d12::util::CreateComputePipeline(device, shaders::native_hook_desaturate_cs,
+                                                   sizeof(shaders::native_hook_desaturate_cs),
+                                                   native_hook_desaturate_root_signature_.Get());
+      }
+      if (!native_hook_desaturate_root_signature_ || !native_hook_desaturate_pipeline_) {
+        native_hook_desaturate_pipeline_.Reset();
+        native_hook_desaturate_root_signature_.Reset();
+        REXGPU_WARN("D3D12TextureCache: Failed to create the native hook example pipeline");
+      }
+    }
+  }
+
   srv_descriptor_cache_allocated_ = 0;
 
   // Create a heap with null SRV descriptors, since it's faster to copy a
@@ -648,14 +755,86 @@ bool D3D12TextureCache::Initialize() {
 void D3D12TextureCache::ClearCache() {
   TextureCache::ClearCache();
 
+  // Nothing in flight can be referenced after a full clear - release retired
+  // replacement descriptors and resources now, before the descriptor cache they
+  // may return to (bindful) is reset below.
+  for (const auto& retired_descriptor : retired_srv_descriptors_) {
+    ReleaseTextureDescriptor(retired_descriptor.second);
+  }
+  retired_srv_descriptors_.clear();
+  retired_resources_.clear();
+  if (texture_replacement_) {
+    texture_replacement_->ClearCache();
+  }
+
   // Clear texture descriptor cache.
   srv_descriptor_cache_free_.clear();
   srv_descriptor_cache_allocated_ = 0;
   srv_descriptor_cache_.clear();
 }
 
+void D3D12TextureCache::InitializeTextureReplacement(const std::filesystem::path& cache_root,
+                                                     uint32_t title_id) {
+  if (!REXCVAR_GET(texture_dump) && !REXCVAR_GET(texture_replace)) {
+    texture_replacement_.reset();
+    return;
+  }
+  auto replacement_manager = std::make_unique<TextureReplacementManager>();
+  replacement_manager->Initialize(cache_root, title_id, command_processor_.GetD3D12Provider());
+  texture_replacement_ = std::move(replacement_manager);
+}
+
+void D3D12TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  while (!retired_srv_descriptors_.empty() &&
+         retired_srv_descriptors_.front().first <= completed_submission_index) {
+    ReleaseTextureDescriptor(retired_srv_descriptors_.front().second);
+    retired_srv_descriptors_.pop_front();
+  }
+  // ComPtr destruction on erase releases the underlying resources.
+  for (auto it = retired_resources_.begin(); it != retired_resources_.end();) {
+    if (it->first <= completed_submission_index) {
+      it = retired_resources_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (texture_replacement_) {
+    texture_replacement_->Reclaim(completed_submission_index);
+  }
+  TextureCache::CompletedSubmissionUpdated(completed_submission_index);
+}
+
+void D3D12TextureCache::DeferTextureDescriptorRelease(uint32_t descriptor_index,
+                                                      uint64_t submission) {
+  retired_srv_descriptors_.emplace_back(submission, descriptor_index);
+}
+
+void D3D12TextureCache::DeferTextureResourceRelease(
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource, uint64_t submission) {
+  retired_resources_.emplace_back(submission, std::move(resource));
+}
+
+void D3D12TextureCache::LogReplacementFailureOnce(uint64_t hash, const char* reason) {
+  if (replacement_failure_hashes_.insert(hash).second) {
+    REXGPU_ERROR("D3D12TextureCache: Texture replacement {:016X} not applied: {}", hash, reason);
+  }
+}
+
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
+
+  // A change of texture_replace_variant swaps art at run time: the textures that wear a
+  // replacement, and those the variant has a file for, load again and pick the new one.
+  bool skip_ui_changed = false;
+  if (texture_replacement_ && texture_replacement_->PollVariant(&skip_ui_changed)) {
+    TextureReplacementManager& manager = *texture_replacement_;
+    MarkTexturesOutdated([&manager, skip_ui_changed](Texture& texture) {
+      const D3D12Texture& d3d12_texture = static_cast<const D3D12Texture&>(texture);
+      return (skip_ui_changed && texture.key().mip_max_level == 0) ||
+             d3d12_texture.has_replacement() ||
+             manager.HasVariantFile(d3d12_texture.last_content_hash());
+    });
+  }
 
   // ExecuteCommandLists is a full UAV and aliasing barrier.
   if (IsDrawResolutionScaled()) {
@@ -782,6 +961,18 @@ bool D3D12TextureCache::AreActiveTextureSRVKeysUpToDate(
         key.swizzled_signs != binding->swizzled_signs) {
       return false;
     }
+    uint32_t descriptor_generation = 0;
+    if (binding->texture) {
+      descriptor_generation +=
+          static_cast<D3D12Texture*>(binding->texture)->descriptor_generation();
+    }
+    if (binding->texture_signed) {
+      descriptor_generation +=
+          static_cast<D3D12Texture*>(binding->texture_signed)->descriptor_generation();
+    }
+    if (key.descriptor_generation != descriptor_generation) {
+      return false;
+    }
   }
   return true;
 }
@@ -796,11 +987,21 @@ void D3D12TextureCache::WriteActiveTextureSRVKeys(
       key.key.MakeInvalid();
       key.host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_0000;
       key.swizzled_signs = kSwizzledSignsUnsigned;
+      key.descriptor_generation = 0;
       continue;
     }
     key.key = binding->key;
     key.host_swizzle = binding->host_swizzle;
     key.swizzled_signs = binding->swizzled_signs;
+    key.descriptor_generation = 0;
+    if (binding->texture) {
+      key.descriptor_generation +=
+          static_cast<D3D12Texture*>(binding->texture)->descriptor_generation();
+    }
+    if (binding->texture_signed) {
+      key.descriptor_generation +=
+          static_cast<D3D12Texture*>(binding->texture_signed)->descriptor_generation();
+    }
   }
 }
 
@@ -875,6 +1076,20 @@ void D3D12TextureCache::WriteActiveTextureBindfulSRV(
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
     device->CopyDescriptorsSimple(1, handle, source_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   }
+}
+
+ID3D12Resource* D3D12TextureCache::GetActiveTextureResource(uint32_t fetch_constant_index,
+                                                            uint32_t* width,
+                                                            uint32_t* height) const {
+  Texture* texture = GetActiveTexture(fetch_constant_index);
+  if (!texture) return nullptr;
+  ID3D12Resource* resource = static_cast<D3D12Texture*>(texture)->resource();
+  if (resource) {
+    D3D12_RESOURCE_DESC desc = resource->GetDesc();
+    if (width) *width = uint32_t(desc.Width);
+    if (height) *height = desc.Height;
+  }
+  return resource;
 }
 
 uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
@@ -1337,6 +1552,232 @@ void D3D12TextureCache::TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE
                                            new_state);
 }
 
+void D3D12TextureCache::WriteNativeResolveToTextures(const NativeResolveWrite& write,
+                                                     D3D12_RESOURCE_STATES& source_state,
+                                                     NativeResolveWriteCounts& counts) {
+  if (!write.source || !write.width || !write.height) {
+    return;
+  }
+  const bool scaled = IsDrawResolutionScaled();
+  const uint32_t scale_x = draw_resolution_scale_x();
+  const uint32_t scale_y = draw_resolution_scale_y();
+  ForEachTextureAtBasePage(write.base_page, [&](Texture& texture) {
+    const TextureKey& key = texture.key();
+    if (!key.tiled || key.dimension != xenos::DataDimension::k2DOrStacked ||
+        key.depth_or_array_size_minus_1 != 0 || key.mip_max_level != 0 || IsBaseInPackedMipTail(key) ||
+        key.signed_separate || key.format != write.format || key.pitch != write.pitch ||
+        key.endianness != write.endianness || bool(key.scaled_resolve) != scaled ||
+        texture.GetGuestMipsSize() != 0) {
+      ++counts.incompatible;
+      return;
+    }
+    if (!texture.base_up_to_date_before_resolve()) {
+      ++counts.not_up_to_date;
+      return;
+    }
+    auto& d3d12_texture = static_cast<D3D12Texture&>(texture);
+    // Sampling goes to the replacement resource, and the reload decides whether to keep it.
+    if (d3d12_texture.has_replacement() || !d3d12_texture.resource()) {
+      ++counts.replacement;
+      return;
+    }
+    uint32_t texture_width = key.GetWidth();
+    uint32_t texture_height = key.GetHeight();
+    if (write.dest_x >= texture_width || write.dest_y >= texture_height) {
+      ++counts.outside;
+      return;
+    }
+    uint32_t width = std::min(write.width, texture_width - write.dest_x);
+    uint32_t height = std::min(write.height, texture_height - write.dest_y);
+    ID3D12Resource* texture_resource = d3d12_texture.resource();
+    const NativeResolveHookInfo hook_info = {uint32_t(key.base_page) << 12, key.format,
+                                             texture_width * scale_x, texture_height * scale_y,
+                                             write.exp_bias};
+
+    if (write.mode != NativeResolveMode::kCopy) {
+      if (!native_resolve_pipeline_) {
+        ++counts.no_pipeline;
+        return;
+      }
+      // Created before gpu_native_resolves was enabled, or not matching the CreateTexture
+      // conditions.
+      if (!(texture_resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+        ++counts.no_uav;
+        return;
+      }
+      ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+      if (!command_processor_.RequestOneUseSingleViewDescriptors(
+              uint32_t(rex::countof(descriptors)), descriptors)) {
+        ++counts.descriptors;
+        return;
+      }
+      ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+      if (write.source_srv_format == DXGI_FORMAT_UNKNOWN) {
+        device->CopyDescriptorsSimple(1, descriptors[0].first, write.source_srv,
+                                      D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+      } else {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc;
+        srv_desc.Format = write.source_srv_format;
+        srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv_desc.Texture2D.MostDetailedMip = 0;
+        srv_desc.Texture2D.MipLevels = 1;
+        srv_desc.Texture2D.PlaneSlice = 0;
+        srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
+        device->CreateShaderResourceView(write.source, &srv_desc, descriptors[0].first);
+      }
+      D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+      uav_desc.Format = write.dest_uav_format;
+      uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+      uav_desc.Texture2D.MipSlice = 0;
+      uav_desc.Texture2D.PlaneSlice = 0;
+      device->CreateUnorderedAccessView(texture_resource, nullptr, &uav_desc,
+                                        descriptors[1].first);
+
+      // Referenced by the command list now.
+      texture.MarkAsUsed();
+      command_processor_.PushTransitionBarrier(write.source, source_state,
+                                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      source_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+      D3D12_RESOURCE_STATES texture_state =
+          d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      command_processor_.PushTransitionBarrier(texture_resource, texture_state,
+                                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      command_processor_.SubmitBarriers();
+
+      DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+      command_processor_.SetExternalPipeline(native_resolve_pipeline_.Get());
+      command_list.D3DSetComputeRootSignature(native_resolve_root_signature_.Get());
+      command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+      command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+      NativeResolveConstants constants;
+      constants.mode = uint32_t(write.mode);
+      constants.scale = write.scale;
+      constants.source_offset[0] = int32_t(write.source_x * scale_x);
+      constants.source_offset[1] = int32_t(write.source_y * scale_y);
+      constants.dest_offset[0] = int32_t(write.dest_x * scale_x);
+      constants.dest_offset[1] = int32_t(write.dest_y * scale_y);
+      constants.size[0] = width * scale_x;
+      constants.size[1] = height * scale_y;
+      constants.fill[0] = write.fill_x;
+      constants.fill[1] = write.fill_y;
+      command_list.D3DSetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(uint32_t),
+                                                   &constants, 0);
+      command_list.D3DDispatch((constants.size[0] + 7) >> 3, (constants.size[1] + 7) >> 3, 1);
+
+      // Leave the texture in the state its users expect it to be in.
+      command_processor_.PushUAVBarrier(texture_resource);
+      command_processor_.PushTransitionBarrier(
+          texture_resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, texture_state);
+      d3d12_texture.SetResourceState(texture_state);
+
+      ApplyNativeResolveHooks(d3d12_texture, hook_info, counts);
+      MakeTextureUpToDateAndWatch(texture);
+      ++counts.written;
+      return;
+    }
+
+    // The half-pixel offset gap fill needs a shader mode.
+    assert_true(!write.fill_x && !write.fill_y);
+
+    // Referenced by the command list now.
+    texture.MarkAsUsed();
+    command_processor_.PushTransitionBarrier(write.source, source_state,
+                                             D3D12_RESOURCE_STATE_COPY_SOURCE);
+    source_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    D3D12_RESOURCE_STATES texture_state =
+        d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.PushTransitionBarrier(texture_resource, texture_state,
+                                             D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.SubmitBarriers();
+
+    D3D12_TEXTURE_COPY_LOCATION location_dest;
+    location_dest.pResource = texture_resource;
+    location_dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    location_dest.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION location_source;
+    location_source.pResource = write.source;
+    location_source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    location_source.SubresourceIndex = 0;
+    D3D12_BOX source_box;
+    source_box.left = write.source_x * scale_x;
+    source_box.top = write.source_y * scale_y;
+    source_box.front = 0;
+    source_box.right = (write.source_x + width) * scale_x;
+    source_box.bottom = (write.source_y + height) * scale_y;
+    source_box.back = 1;
+    command_processor_.GetDeferredCommandList().D3DCopyTextureRegion(
+        &location_dest, write.dest_x * scale_x, write.dest_y * scale_y, 0, &location_source,
+        &source_box);
+
+    // Leave the texture in the state its users expect it to be in.
+    command_processor_.PushTransitionBarrier(texture_resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             texture_state);
+    d3d12_texture.SetResourceState(texture_state);
+
+    ApplyNativeResolveHooks(d3d12_texture, hook_info, counts);
+    MakeTextureUpToDateAndWatch(texture);
+    ++counts.written;
+  });
+}
+
+void D3D12TextureCache::ApplyNativeResolveHooks(D3D12Texture& texture,
+                                                const NativeResolveHookInfo& info,
+                                                NativeResolveWriteCounts& counts) {
+  // Hook point: the texture holds the resolved image, in its regular state, and the game samples
+  // it once WriteNativeResolveToTextures marks it up to date. To add an effect: a cvar (flags.h),
+  // a compute shader built into shaders/bytecode/d3d12_5_1, its root signature and pipeline
+  // created in Initialize only with the cvar on, a condition on info below, and a dispatch on the
+  // texture's UAV with the barriers of the example (UAV in, UAV barrier, previous state back), and
+  // a counter in NativeResolveWriteCounts logged by D3D12RenderTargetCache::ReportNativeResolves.
+  if (native_hook_desaturate_pipeline_ &&
+      info.format == xenos::TextureFormat::k_16_16_16_16_FLOAT && info.exp_bias < 0 &&
+      info.width && info.height) {
+    ID3D12Resource* texture_resource = texture.resource();
+    // Created before gpu_native_resolves was enabled, or not matching the CreateTexture conditions.
+    if (!(texture_resource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+      return;
+    }
+    ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor;
+    if (!command_processor_.RequestOneUseSingleViewDescriptors(1, &descriptor)) {
+      return;
+    }
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc;
+    uav_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav_desc.Texture2D.MipSlice = 0;
+    uav_desc.Texture2D.PlaneSlice = 0;
+    command_processor_.GetD3D12Provider().GetDevice()->CreateUnorderedAccessView(
+        texture_resource, nullptr, &uav_desc, descriptor.first);
+
+    // Referenced by the command list now.
+    texture.MarkAsUsed();
+    D3D12_RESOURCE_STATES texture_state =
+        texture.SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor_.PushTransitionBarrier(texture_resource, texture_state,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    command_processor_.SubmitBarriers();
+
+    DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+    command_processor_.SetExternalPipeline(native_hook_desaturate_pipeline_.Get());
+    command_list.D3DSetComputeRootSignature(native_hook_desaturate_root_signature_.Get());
+    command_list.D3DSetComputeRootDescriptorTable(1, descriptor.second);
+    NativeHookDesaturateConstants constants;
+    constants.size[0] = info.width;
+    constants.size[1] = info.height;
+    command_list.D3DSetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(uint32_t),
+                                                 &constants, 0);
+    command_list.D3DDispatch((info.width + 7) >> 3, (info.height + 7) >> 3, 1);
+
+    // Leave the texture in the state its users expect it to be in.
+    command_processor_.PushUAVBarrier(texture_resource);
+    command_processor_.PushTransitionBarrier(texture_resource,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, texture_state);
+    texture.SetResourceState(texture_state);
+    ++counts.hook_example;
+  }
+}
+
 void D3D12TextureCache::CreateCurrentScaledResolveRangeUintPow2SRV(
     D3D12_CPU_DESCRIPTOR_HANDLE handle, uint32_t element_size_bytes_pow2) {
   assert_true(IsDrawResolutionScaled());
@@ -1427,6 +1868,61 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+}
+
+void D3D12TextureCache::D3D12Texture::SetReplacement(ID3D12Resource* resource, DXGI_FORMAT format,
+                                                     uint32_t mip_levels, uint64_t hash) {
+  auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  uint64_t submission = d3d12_texture_cache.command_processor_.GetCurrentSubmission();
+  for (const auto& descriptor_pair : srv_descriptors_) {
+    d3d12_texture_cache.DeferTextureDescriptorRelease(descriptor_pair.second, submission);
+  }
+  srv_descriptors_.clear();
+  if (replacement_resource_) {
+    d3d12_texture_cache.DeferTextureResourceRelease(replacement_resource_, submission);
+    replacement_resource_.Reset();
+  }
+  replacement_resource_ = resource;
+  replacement_format_ = format;
+  replacement_mip_levels_ = mip_levels;
+  replacement_hash_ = hash;
+  ++descriptor_generation_;
+  ID3D12Device* device =
+      d3d12_texture_cache.command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC guest_desc = resource_->GetDesc();
+  D3D12_RESOURCE_DESC replacement_desc = replacement_resource_->GetDesc();
+  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &guest_desc).SizeInBytes +
+                     device->GetResourceAllocationInfo(0, 1, &replacement_desc).SizeInBytes);
+}
+
+void D3D12TextureCache::D3D12Texture::ClearReplacement() {
+  if (!replacement_resource_) {
+    return;
+  }
+  auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  uint64_t submission = d3d12_texture_cache.command_processor_.GetCurrentSubmission();
+  for (const auto& descriptor_pair : srv_descriptors_) {
+    d3d12_texture_cache.DeferTextureDescriptorRelease(descriptor_pair.second, submission);
+  }
+  srv_descriptors_.clear();
+  d3d12_texture_cache.DeferTextureResourceRelease(replacement_resource_, submission);
+  replacement_resource_.Reset();
+  replacement_format_ = DXGI_FORMAT_UNKNOWN;
+  replacement_mip_levels_ = 0;
+  replacement_hash_ = 0;
+  ++descriptor_generation_;
+  ID3D12Device* device =
+      d3d12_texture_cache.command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC guest_desc = resource_->GetDesc();
+  SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &guest_desc).SizeInBytes);
+}
+
+bool D3D12TextureCache::D3D12Texture::NoteContentHash(uint64_t hash) {
+  if (last_content_hash_ != 0 && hash != last_content_hash_) {
+    ++content_changes_;
+  }
+  last_content_hash_ = hash;
+  return !is_dynamic_content();
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
@@ -1544,6 +2040,23 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   // Untiling through a buffer instead of using unordered access because copying
   // is not done that often.
   desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  if ((desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+       desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS) &&
+      desc.Width >= 1024 && desc.Height >= 512) {
+    // The scene colour resolve target: the temporal upscaler writes its result back into it.
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  }
+  if (REXCVAR_GET(gpu_native_resolves) && key.tiled &&
+      key.dimension == xenos::DataDimension::k2DOrStacked && key.depth_or_array_size_minus_1 == 0 &&
+      key.mip_max_level == 0 &&
+      (key.format == xenos::TextureFormat::k_16_16_FLOAT ||
+       key.format == xenos::TextureFormat::k_16_16_16_16_FLOAT ||
+       key.format == xenos::TextureFormat::k_8_8_8_8 ||
+       key.format == xenos::TextureFormat::k_24_8 ||
+       key.format == xenos::TextureFormat::k_24_8_FLOAT)) {
+    // Native resolve destinations written by native_resolve_cs (WriteNativeResolveToTextures).
+    desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  }
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.
@@ -1554,7 +2067,130 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
+  stats::Record(stats::Counter::kTextureAllocations);
   return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+}
+
+void D3D12TextureCache::MaybeUpdateReplacement(D3D12Texture& texture) {
+  if (!texture_replacement_) {
+    return;
+  }
+  const TextureKey& key = texture.key();
+  // Upload-time policy mirroring HashGuest: never hash, dump or replace
+  // scaled resolves, GPU-written ranges, non-2D textures and arrays,
+  // signed-separate formats or the 3D-as-2D wrapper.
+  if (key.scaled_resolve || texture.force_load_3d_tiling()) {
+    return;
+  }
+  if (key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1) {
+    return;
+  }
+  if (IsSignedVersionSeparateForFormat(key) || texture.is_dynamic_content()) {
+    return;
+  }
+  uint32_t base_size = texture.GetGuestBaseSize();
+  uint32_t mips_size = texture.GetGuestMipsSize();
+  uint32_t base_address = key.base_page << 12;
+  uint32_t mips_address = key.mip_page << 12;
+  bool gpu_written = false;
+  if (base_size != 0) {
+    gpu_written = shared_memory().IsRangeGpuWritten(base_address, base_size);
+  }
+  if (!gpu_written && mips_size != 0) {
+    gpu_written = shared_memory().IsRangeGpuWritten(mips_address, mips_size);
+  }
+  GuestTextureDesc desc;
+  desc.format = key.format;
+  desc.dimension = key.dimension;
+  desc.endianness = key.endianness;
+  desc.width = key.GetWidth();
+  desc.height = key.GetHeight();
+  desc.depth_or_array = key.GetDepthOrArraySize();
+  desc.pitch = key.pitch;
+  desc.tiled = key.tiled != 0;
+  desc.packed_mips = key.packed_mips != 0;
+  desc.mip_max_level = key.mip_max_level;
+  desc.scaled_resolve = key.scaled_resolve != 0;
+  desc.signed_separate_format = IsSignedVersionSeparateForFormat(key);
+  desc.force_3d_tiling = texture.force_load_3d_tiling();
+  desc.base_page = key.base_page;
+  desc.mip_page = key.mip_page;
+  desc.base_size = base_size;
+  desc.mips_size = mips_size;
+  const uint8_t* base_bytes =
+      base_size != 0
+          ? shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(base_address)
+          : nullptr;
+  const uint8_t* mips_bytes =
+      mips_size != 0
+          ? shared_memory().guest_memory().TranslatePhysical<const uint8_t*>(mips_address)
+          : nullptr;
+  uint64_t hash = 0;
+  if (!texture_replacement_->HashGuest(desc, base_bytes, mips_bytes, gpu_written, &hash)) {
+    if (texture.has_replacement()) {
+      texture.ClearReplacement();
+    }
+    return;
+  }
+  if (!texture.NoteContentHash(hash)) {
+    if (texture.has_replacement()) {
+      texture.ClearReplacement();
+    }
+    return;
+  }
+  texture_replacement_->MaybeDump(desc, base_bytes, texture.guest_layout().base.row_pitch_bytes,
+                                  hash);
+  if (texture.replacement_hash() == hash &&
+      texture.replacement_epoch() == texture_replacement_->variant_epoch()) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+  const ReplacementImage* image = nullptr;
+  if (!texture_replacement_->FindReplacement(hash, desc,
+                                             GetMaxHostTextureWidthHeight(key.dimension),
+                                             provider.AreUnalignedBlockTexturesSupported(),
+                                             &image)) {
+    if (texture.has_replacement()) {
+      texture.ClearReplacement();
+    }
+    return;
+  }
+  assert_not_null(image);
+  // The mip-count rule (design 2.2) is enforced by FindReplacement already.
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_RESOURCE_DESC replacement_desc = {};
+  replacement_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  replacement_desc.Alignment = 0;
+  replacement_desc.Width = image->width;
+  replacement_desc.Height = image->height;
+  replacement_desc.DepthOrArraySize = 1;
+  replacement_desc.MipLevels = static_cast<UINT16>(image->mip_levels);
+  replacement_desc.Format = TypelessResourceFormatForReplacement(image->format);
+  replacement_desc.SampleDesc.Count = 1;
+  replacement_desc.SampleDesc.Quality = 0;
+  replacement_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  replacement_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  Microsoft::WRL::ComPtr<ID3D12Resource> replacement_resource;
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesDefault,
+                                             provider.GetHeapFlagCreateNotZeroed(),
+                                             &replacement_desc, D3D12_RESOURCE_STATE_COPY_DEST,
+                                             nullptr, IID_PPV_ARGS(&replacement_resource)))) {
+    LogReplacementFailureOnce(hash, "failed to create the replacement resource");
+    return;
+  }
+  stats::Record(stats::Counter::kTextureAllocations);
+  if (!texture_replacement_->UploadReplacement(command_processor_, replacement_resource.Get(),
+                                               *image)) {
+    LogReplacementFailureOnce(hash, "failed to upload the replacement image");
+    return;
+  }
+  command_processor_.PushTransitionBarrier(
+      replacement_resource.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+      D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+  command_processor_.SubmitBarriers();
+  texture.SetReplacement(replacement_resource.Get(), image->format, image->mip_levels, hash);
+  texture.set_replacement_epoch(texture_replacement_->variant_epoch());
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
@@ -1932,6 +2568,11 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
 
   command_processor_.ReleaseScratchGPUBuffer(copy_buffer, copy_buffer_state);
 
+  // The guest resource and its normal load are untouched - a pack replacement
+  // is an extra resource chosen from the content hash.
+  stats::Record(stats::Counter::kTextureLoads);
+  MaybeUpdateReplacement(d3d12_texture);
+
   return true;
 }
 
@@ -2015,6 +2656,7 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
     return nullptr;
   }
 
+  stats::Record(stats::Counter::kTextureAllocations);
   TextureKey key_2d = key();
   key_2d.depth_or_array_size_minus_1 = 0;
   key_2d.mip_max_level = 0;
@@ -2101,6 +2743,19 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
         }
         desc.Texture2DArray.MostDetailedMip = 0;
         desc.Texture2DArray.MipLevels = 1;
+        desc.Texture2DArray.FirstArraySlice = 0;
+        desc.Texture2DArray.ArraySize = 1;
+        desc.Texture2DArray.PlaneSlice = 0;
+        desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+      } else if (texture.replacement_resource() != nullptr) {
+        // Texture pack replacement: the replacement resource with its own format and mip
+        // count, still a one-slice 2D array view like the guest one - shaders declare 2D
+        // fetches as Texture2DArray.
+        resource_for_view = texture.replacement_resource();
+        desc.Format = is_signed ? TexpackSignedViewFormat(texture.replacement_format())
+                                : texture.replacement_format();
+        desc.Texture2DArray.MostDetailedMip = 0;
+        desc.Texture2DArray.MipLevels = texture.replacement_mip_levels();
         desc.Texture2DArray.FirstArraySlice = 0;
         desc.Texture2DArray.ArraySize = 1;
         desc.Texture2DArray.PlaneSlice = 0;

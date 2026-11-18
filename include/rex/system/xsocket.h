@@ -11,9 +11,14 @@
  */
 
 #include <cstring>
+#include <mutex>
 #include <queue>
+#include <span>
+#include <utility>
+#include <vector>
 
 #include <rex/math.h>
+#include <rex/system/system_link.h>
 #include <rex/system/xobject.h>
 #include <rex/types.h>
 
@@ -93,6 +98,12 @@ class XSocket : public XObject {
   XSocket(KernelState* kernel_state);
   ~XSocket();
 
+  // The guest's WSA error code for the socket call that just failed on this thread.
+  static uint32_t LastHostError();
+  // Guest SOL_SOCKET level and option to the host's; false leaves both as the guest's numbers.
+  static bool NativeSocketOption(uint32_t guest_level, uint32_t guest_optname, int* native_level,
+                                 int* native_optname);
+
   uint64_t native_handle() const { return native_handle_; }
   uint16_t bound_port() const { return bound_port_; }
 
@@ -101,6 +112,9 @@ class XSocket : public XObject {
 
   X_STATUS SetOption(uint32_t level, uint32_t optname, void* optval_ptr, uint32_t optlen);
   X_STATUS IOControl(uint32_t cmd, uint8_t* arg_ptr);
+
+  X_STATUS GetSockName(N_XSOCKADDR_IN* name, int* name_len);
+  X_STATUS GetPeerName(N_XSOCKADDR_IN* name, int* name_len);
 
   X_STATUS Connect(N_XSOCKADDR* name, int name_len);
   X_STATUS Bind(N_XSOCKADDR_IN* name, int name_len);
@@ -129,6 +143,30 @@ class XSocket : public XObject {
 
  private:
   XSocket(KernelState* kernel_state, uint64_t native_handle);
+  int SendCopy(const uint8_t* buf, uint32_t buf_len, uint32_t flags, uint32_t ip, uint16_t port);
+  int SendBroadcast(const uint8_t* buf, uint32_t buf_len, uint32_t flags, uint16_t port);
+  static void CaptureHostError();
+  static void SetHostError(uint32_t wsa_error);
+  bool AcceptDatagram(const system_link::Endpoint& source, const uint8_t* buf, int len);
+  enum class DatagramFate { kAccept, kDrop, kDropAndAnswerHello };
+  bool ShouldSendHelloBeforePayload(uint64_t token) const;
+  void SendBeaconHello(const system_link::Endpoint& destination, uint64_t token, uint32_t flags,
+                       const char* what);
+  void LogBeaconHelloMismatchOnce(const system_link::Endpoint& source, uint64_t theirs,
+                                  uint64_t ours);
+  void LogBeaconDropOnce(const system_link::Endpoint& source, system_link::BeaconVerdict verdict,
+                         uint64_t ours, uint64_t now);
+  DatagramFate JudgeAndRecord(const system_link::Endpoint& source,
+                              std::span<const uint8_t> datagram, uint64_t own_token,
+                              uint64_t now);
+  std::vector<system_link::Endpoint> TakeReplyCopyTargets(uint64_t now_ms);
+  int RecvFromDatagram(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
+                       uint32_t* from_len);
+  int RecvFromStream(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_IN* from,
+                     uint32_t* from_len);
+  bool DiscardPeekedDatagram(uint32_t flags);
+  X_STATUS SetLingerOption(const uint8_t* guest_value);
+
   uint64_t native_handle_ = -1;
 
   AddressFamily af_;    // Address family
@@ -140,6 +178,19 @@ class XSocket : public XObject {
   uint16_t bound_port_ = 0;
 
   bool broadcast_socket_ = false;
+
+  std::mutex peers_mutex_;
+  system_link::RecentSources recent_sources_{system_link::kReplyToSourceWindowMs,
+                                             system_link::kRecentSourceCapacity};
+  system_link::DuplicateFilter duplicates_{system_link::kDuplicateWindowMs,
+                                           system_link::kDuplicateCapacity};
+  system_link::BeaconHellos beacon_hellos_{system_link::kBeaconHelloWindowMs,
+                                           system_link::kBeaconHelloCapacity};
+  system_link::ReplyBudget hello_budget_{1, system_link::kReplyBudgetCapacity};
+  system_link::ReplyBudget reply_budget_{system_link::kReplyCopiesPerSecond,
+                                         system_link::kReplyBudgetCapacity};
+  std::vector<std::pair<system_link::Endpoint, uint64_t>> beacon_mismatch_logs_;
+  std::vector<std::pair<system_link::Endpoint, uint64_t>> beacon_drop_logs_;
 
   std::unique_ptr<rex::thread::Event> event_;
   std::mutex incoming_packet_mutex_;

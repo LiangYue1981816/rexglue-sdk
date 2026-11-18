@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -215,9 +216,17 @@ class UserProfile {
   };
 
   UserProfile();
+  // Profile for local player `user_index` (1-3) of a split-screen session, derived from the
+  // primary profile: its own XUIDs and gamertag, same signin state and type.
+  UserProfile(const UserProfile& primary, uint32_t user_index);
 
+  // xuid() and name() key the saves and profile files on disk, so they never change; the game
+  // sees network_xuid() and gamertag(), which are per install (or per instance) for System Link.
   uint64_t xuid() const { return xuid_; }
   std::string name() const { return name_; }
+  uint64_t network_xuid() const { return network_xuid_; }
+  std::string gamertag() const { return gamertag_; }
+  void LoadNetworkIdentity(const std::filesystem::path& user_data_root);
   uint32_t signin_state() const { return 1; }
   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
 
@@ -229,6 +238,8 @@ class UserProfile {
  private:
   uint64_t xuid_;
   std::string name_;
+  uint64_t network_xuid_;
+  std::string gamertag_;
   std::vector<std::unique_ptr<Setting>> setting_list_;
   std::unordered_map<uint32_t, Setting*> settings_;
   KernelState* kernel_state_ = nullptr;

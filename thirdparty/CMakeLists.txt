@@ -245,8 +245,17 @@ target_compile_options(imgui PRIVATE -w)
 # SDL3 - Cross-platform media layer
 #=============================================================================
 set(SDL_INSTALL ON CACHE BOOL "" FORCE)
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
+if(ANDROID)
+    # Android: SDL is libSDL3.so, the first library SDLActivity loads. Its JNI_OnLoad keeps the
+    # Java VM and activity state SDL needs, so the runtime must use that same copy: a static SDL
+    # inside librexruntime.so would be a second SDL with no JNI state.
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_ANDROID_JAR OFF CACHE BOOL "" FORCE)
+else()
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
@@ -290,7 +299,10 @@ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
 # Linux video and audio backends. Both video drivers are always built so the
 # one in use stays a runtime choice.
-if(UNIX AND NOT APPLE)
+# Not on Android: SDL3 drives windowing/input/audio through its own Android
+# backend, and the desktop X11/Wayland/ALSA/PulseAudio/PipeWire libraries do
+# not exist in the NDK sysroot.
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     set(SDL_X11               ON  CACHE BOOL "" FORCE)
     set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
@@ -443,7 +455,10 @@ endif()
 #=============================================================================
 # ARM64 setup for FFmpeg (NEON optimizations)
 #=============================================================================
-if(IS_ARM64)
+# Not on Android: the bundled FFmpeg assembly is disabled there in favor of
+# the pure C paths (avoids assembler/CPU-feature mismatches with the NDK
+# toolchain, which is driven by -march=armv8.2-a from the build flags).
+if(IS_ARM64 AND NOT ANDROID)
   enable_language(ASM)
   set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -march=armv8-a")
 endif()
@@ -539,8 +554,20 @@ if(IS_X86_64)
     )
 endif()
 
+# Android-only (arm64): the aarch64 assembly sources stay disabled in favor of the pure C
+# fallback. ffmpeg-android/config.h, found ahead of FFmpeg's own config.h, takes FFmpeg's
+# config_android_aarch64.h and sets ARCH_AARCH64 and HAVE_ARMV8/NEON/VFP to 0 so the generic C
+# init functions are used. The stub file is kept as a fallback for unoptimized builds, where an
+# `if (0)`-guarded call may still emit a reference; it is compiled into libavutil (which libavcodec
+# links publicly), so references from both archives resolve. Desktop builds are unaffected.
+set(FFMPEG_ANDROID_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-android")
+if(ANDROID)
+    target_sources(libavutil PRIVATE "${FFMPEG_ANDROID_DIR}/aarch64_stubs.c")
+    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_ANDROID_DIR}")
+endif()
+
 # ARM64 optimizations for libavutil
-if(IS_ARM64)
+if(IS_ARM64 AND NOT ANDROID)
     target_sources(libavutil PRIVATE
         ${FFMPEG_DIR}/libavutil/aarch64/cpu.c
         ${FFMPEG_DIR}/libavutil/aarch64/float_dsp_init.c
@@ -662,7 +689,7 @@ if(IS_X86_64)
 endif()
 
 # ARM64 optimizations for libavcodec
-if(IS_ARM64)
+if(IS_ARM64 AND NOT ANDROID)
     target_sources(libavcodec PRIVATE
         ${FFMPEG_DIR}/libavcodec/aarch64/fft_init_aarch64.c
         ${FFMPEG_DIR}/libavcodec/aarch64/fft_neon.S
@@ -691,6 +718,9 @@ target_include_directories(libavcodec
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
 target_link_libraries(libavcodec PUBLIC libavutil)
+if(ANDROID)
+    target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_ANDROID_DIR}")
+endif()
 if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
 endif()

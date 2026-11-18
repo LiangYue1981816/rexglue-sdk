@@ -26,6 +26,17 @@
 #include <rex/math.h>
 #include <rex/string/buffer.h>
 
+#if REX_PLATFORM_ANDROID
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(vulkan_android_invariant_position_member, false, "GPU/Vulkan",
+                    "Also decorate the gl_Position member of translated vertex shaders as "
+                    "Invariant (as glslang does for 'invariant gl_Position'), so a depth pass and "
+                    "the color pass after it compute bit-identical depth on drivers that ignore "
+                    "the decoration on the whole output block")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+#endif
+
 namespace rex::graphics {
 
 SpirvShaderTranslator::Features::Features(bool all)
@@ -1750,6 +1761,12 @@ void SpirvShaderTranslator::StartVertexOrTessEvalShaderBeforeMain() {
   builder_->addMemberName(type_struct_per_vertex, kOutputPerVertexMemberPosition, "gl_Position");
   builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
                                 spv::DecorationBuiltIn, spv::BuiltInPosition);
+#if REX_PLATFORM_ANDROID
+  if (REXCVAR_GET(vulkan_android_invariant_position_member)) {
+    builder_->addMemberDecoration(type_struct_per_vertex, kOutputPerVertexMemberPosition,
+                                  spv::DecorationInvariant);
+  }
+#endif
   if (output_per_vertex_member_clip_distance_ != UINT32_MAX) {
     builder_->addMemberName(type_struct_per_vertex, output_per_vertex_member_clip_distance_,
                             "gl_ClipDistance");

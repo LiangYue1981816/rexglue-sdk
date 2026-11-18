@@ -12,6 +12,13 @@
 #include <rex/filesystem/devices/host_path_entry.h>
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <system_error>
+#include <unordered_map>
 
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
@@ -20,6 +27,102 @@
 #include <rex/string/utf8.h>
 
 namespace rex::filesystem {
+
+namespace {
+
+// Lower-cases and turns '\' into '/' so guest paths compare the same no
+// matter how the host or the environment spelled them.
+std::string NormalizeOverrideKey(std::string_view path) {
+  std::string out;
+  out.reserve(path.size());
+  for (char c : path) {
+    if (c == '\\') {
+      out.push_back('/');
+    } else {
+      out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+  }
+  return out;
+}
+
+// GOW2_VFS_OVERRIDES_FILE names a UTF-8 file of "guest=host" lines, for lists
+// too long for one environment variable.
+void AddOverridesFromFile(std::unordered_map<std::string, std::string>& table) {
+#ifdef _WIN32
+  // Wide read so a cache folder under a non-ASCII user name survives.
+  const wchar_t* raw = _wgetenv(L"GOW2_VFS_OVERRIDES_FILE");
+#else
+  const char* raw = std::getenv("GOW2_VFS_OVERRIDES_FILE");
+#endif
+  if (!raw || !*raw) {
+    return;
+  }
+  std::filesystem::path path(raw);
+  std::ifstream file(path, std::ios::binary);
+  if (!file) {
+    REXLOG_WARN("vfs overrides file: cannot open {}", rex::path_to_utf8(path));
+    return;
+  }
+  size_t count = 0;
+  std::string line;
+  while (std::getline(file, line)) {
+    if (!line.empty() && line.back() == '\r') {
+      line.pop_back();
+    }
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) {
+      continue;
+    }
+    std::string key = NormalizeOverrideKey(std::string_view(line).substr(0, eq));
+    std::string value = line.substr(eq + 1);
+    if (key.empty() || value.empty()) {
+      continue;
+    }
+    table[key] = value;
+    ++count;
+  }
+  REXLOG_INFO("vfs overrides file: {} entries from {}", count, rex::path_to_utf8(path));
+}
+
+// GOW2_VFS_OVERRIDES="guest/relative/path=C:\host\file;other/path=D:\x\y".
+// Parsed once; later edits of the variable do not re-read it.
+const std::unordered_map<std::string, std::string>& GetVfsOverrides() {
+  static const std::unordered_map<std::string, std::string> overrides = [] {
+    std::unordered_map<std::string, std::string> table;
+    // File first so the variable wins on a duplicate key.
+    AddOverridesFromFile(table);
+    const char* raw = std::getenv("GOW2_VFS_OVERRIDES");
+    if (!raw || !*raw) {
+      return table;
+    }
+    std::string_view rest(raw);
+    while (!rest.empty()) {
+      size_t semi = rest.find(';');
+      std::string_view item = rest.substr(0, semi);
+      rest = (semi == std::string_view::npos) ? std::string_view() : rest.substr(semi + 1);
+      if (item.empty()) {
+        continue;
+      }
+      size_t eq = item.find('=');
+      if (eq == std::string_view::npos) {
+        continue;
+      }
+      std::string key = NormalizeOverrideKey(item.substr(0, eq));
+      std::string value(item.substr(eq + 1));
+      if (key.empty() || value.empty()) {
+        continue;
+      }
+      table[key] = value;
+    }
+    return table;
+  }();
+  return overrides;
+}
+
+}  // namespace
 
 HostPathDevice::HostPathDevice(const std::string_view mount_path,
                                const std::filesystem::path& host_path, bool read_only,
@@ -115,9 +218,31 @@ Entry* HostPathDevice::ResolvePath(const std::string_view path) {
 
 void HostPathDevice::PopulateEntry(HostPathEntry* parent_entry) {
   auto child_infos = rex::filesystem::ListFiles(parent_entry->host_path());
+  const auto& overrides = GetVfsOverrides();
+  const bool allow_overrides = read_only_ && !overrides.empty();
   for (auto& child_info : child_infos) {
-    auto child = HostPathEntry::Create(this, parent_entry,
-                                       parent_entry->host_path() / child_info.name, child_info);
+    std::filesystem::path child_host_path = parent_entry->host_path() / child_info.name;
+    rex::filesystem::FileInfo effective_info = child_info;
+    if (allow_overrides && child_info.type != rex::filesystem::FileInfo::Type::kDirectory) {
+      std::error_code ec;
+      std::filesystem::path relative =
+          std::filesystem::relative(child_host_path, host_path_, ec);
+      if (!ec) {
+        auto it = overrides.find(NormalizeOverrideKey(rex::path_to_utf8(relative)));
+        if (it != overrides.end()) {
+          std::filesystem::path override_host_path = rex::to_path(it->second);
+          rex::filesystem::FileInfo override_info;
+          if (rex::filesystem::GetInfo(override_host_path, &override_info)) {
+            // Keep the original child name so the game still sees its file.
+            override_info.name = child_info.name;
+            effective_info = override_info;
+            child_host_path = override_host_path;
+            REXLOG_INFO("vfs override: {} -> {}", rex::path_to_utf8(relative), it->second);
+          }
+        }
+      }
+    }
+    auto child = HostPathEntry::Create(this, parent_entry, child_host_path, effective_info);
     parent_entry->children_.push_back(std::unique_ptr<Entry>(child));
 
     if (child_info.type == rex::filesystem::FileInfo::Type::kDirectory) {

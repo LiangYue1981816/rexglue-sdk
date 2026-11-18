@@ -17,6 +17,8 @@
 #include <rex/cvar.h>
 #include <rex/graphics/d3d12/command_processor.h>
 #include <rex/graphics/d3d12/shared_memory.h>
+
+#include "performance_stats.h"
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -330,6 +332,8 @@ bool D3D12SharedMemory::UploadRanges(
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));
+      stats::Record(stats::Counter::kGuestUploads);
+      stats::Record(stats::Counter::kGuestUploadBytes, upload_buffer_size);
       uint32_t upload_buffer_pages = uint32_t(upload_buffer_size >> page_size_log2());
       upload_range_start += upload_buffer_pages;
       upload_range_length -= upload_buffer_pages;

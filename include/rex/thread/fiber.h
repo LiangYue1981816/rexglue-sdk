@@ -20,9 +20,29 @@
 // before including <ucontext.h>.
 #define _XOPEN_SOURCE 700
 #endif
+#if !REX_PLATFORM_ANDROID
+// Bionic provides no ucontext.h user context functions (getcontext /
+// makecontext / swapcontext); the Android context type below is used instead.
 #include <ucontext.h>
+#endif
 #include <cstdint>
 #include <vector>
+#endif
+
+#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
+// Minimal AArch64 fiber context for Android: callee-saved registers plus the
+// stack pointer. x0_ is restored into x0 on switch; fresh fibers use it to
+// receive their Fiber* in the start trampoline.
+struct AndroidFiberContext {
+  uint64_t x0_ = 0;
+  uint64_t x19_[10] = {};
+  uint64_t fp_ = 0;
+  uint64_t lr_ = 0;
+  uint64_t sp_ = 0;
+  // The low 64 bits of v8-v15 (d8-d15) are callee-saved too (AAPCS64).
+  uint64_t d8_[8] = {};
+};
+static_assert(sizeof(AndroidFiberContext) == 22 * sizeof(uint64_t));
 #endif
 
 namespace rex::thread {
@@ -57,13 +77,23 @@ struct Fiber {
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
 #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
+  AndroidFiberContext context_{};
+#else
   ucontext_t context_{};
+#endif
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;
   void* arg_ = nullptr;
   bool is_thread_fiber_ = false;
 
   static void Trampoline();
+#if REX_PLATFORM_ANDROID && REX_ARCH_ARM64
+  // Android AArch64 entry point for freshly created fibers (bionic has no
+  // makecontext, so the fiber is entered directly with the Fiber* in x0).
+  // A member so it can reach entry_/arg_, which stay private.
+  static void StartTrampoline(Fiber* f);
+#endif
 #endif
 };
 

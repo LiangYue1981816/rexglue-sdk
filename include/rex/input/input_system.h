@@ -71,4 +71,14 @@ class InputSystem : public system::IInputSystem {
 /// In tool mode, only the NOP driver is added.
 std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode);
 
+// Physical controller activity across the input drivers (SDL, XInput): the host uptime in
+// milliseconds (rex::chrono::Clock::QueryHostUptimeMillis) of the last button press or
+// stick/trigger movement past a threshold, and the SDL_GamepadType of that controller (0 when
+// unknown). Emulated pads (keyboard and mouse, touch) never report here.
+void NotePhysicalPadActivity(int sdl_gamepad_type);
+// A controller connected: sets only the type.
+void NotePhysicalPadType(int sdl_gamepad_type);
+// out_sdl_gamepad_type may be null; time 0 = no activity yet.
+uint64_t LastPhysicalPadActivity(int* out_sdl_gamepad_type);
+
 }  // namespace rex::input

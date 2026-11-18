@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,14 @@ REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan de
 namespace rex {
 namespace ui {
 namespace vulkan {
+
+namespace {
+std::atomic<VulkanInstance::LoaderOpener> loader_opener{nullptr};
+}  // namespace
+
+void VulkanInstance::SetLoaderOpener(LoaderOpener opener) {
+  loader_opener.store(opener);
+}
 
 std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
                                                        const bool try_enable_validation) {
@@ -75,7 +84,15 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
     return nullptr;
   }
 #else
-  loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+  LoaderOpener opener = loader_opener.load();
+  void* app_loader = opener ? opener() : nullptr;
+  if (app_loader) {
+    vulkan_instance->loader_.Adopt(app_loader);
+    loader_loaded = true;
+    REXLOG_INFO("Using the Vulkan loader opened by the app");
+  } else {
+    loader_loaded = vulkan_instance->loader_.Load(platform::lib_names::kVulkanLoader);
+  }
   if (!loader_loaded) {
     REXLOG_ERROR("Failed to load {}", platform::lib_names::kVulkanLoader);
     return nullptr;

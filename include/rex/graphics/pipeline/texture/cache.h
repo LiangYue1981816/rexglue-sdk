@@ -10,6 +10,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <functional>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include <rex/graphics/shared_memory.h>
 #include <rex/graphics/xenos.h>
 #include <rex/hash.h>
+#include <rex/platform.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::graphics {
@@ -81,6 +83,9 @@ class TextureCache {
   virtual void BeginFrame();
 
   void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // gpu_native_resolves: for the textures with the base page in the range, records whether the
+  // base level is up to date, to be called right before MarkRangeAsResolved invalidates them.
+  void CaptureUpToDateBeforeResolve(uint32_t start, uint32_t length);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -129,6 +134,25 @@ class TextureCache {
     return (binding->texture && binding->texture->key().scaled_resolve) ||
            (binding->texture_signed && binding->texture_signed->key().scaled_resolve);
   }
+
+#if REX_PLATFORM_ANDROID
+  // Texture loads since the last TakeAndroidTextureLoadStats. "gpu_written" counts loads with a
+  // range a resolve or memexport wrote into the GPU's copy of guest memory: the CPU-side bytes of
+  // such a range say nothing, so it is not checked for zero. "zero" counts the other loaded ranges
+  // whose CPU-side guest data was all zero (block-compressed formats apart, as a DXT texture is
+  // never a resolve target); invalidations count memory watches that fired.
+  struct AndroidTextureLoadStats {
+    uint32_t loads = 0;
+    uint32_t gpu_written = 0;
+    uint32_t zero_base_compressed = 0;
+    uint32_t zero_mips_compressed = 0;
+    uint32_t zero_other = 0;
+    uint32_t reloaded_after_zero = 0;
+    uint32_t invalidations = 0;
+  };
+  AndroidTextureLoadStats TakeAndroidTextureLoadStats();
+  void SetAndroidTextureZeroCheck(bool enabled) { android_texture_zero_check_ = enabled; }
+#endif
 
  protected:
   struct TextureKey {
@@ -228,7 +252,18 @@ class TextureCache {
     }
     void MakeUpToDateAndWatch(const std::unique_lock<std::recursive_mutex>& global_lock);
 
+    // gpu_native_resolves: whether the base level was up to date as of the last
+    // CaptureUpToDateBeforeResolve covering the base page.
+    bool base_up_to_date_before_resolve() const { return base_up_to_date_before_resolve_; }
+    void CaptureBaseUpToDateBeforeResolve(const std::unique_lock<std::recursive_mutex>& global_lock) {
+      base_up_to_date_before_resolve_ = !base_outdated(global_lock);
+    }
+
     void WatchCallback(const std::unique_lock<std::recursive_mutex>& global_lock, bool is_mip);
+
+    // Makes the next use reload the guest data, as if the guest had written the memory: the
+    // memory watches are released first (WatchCallback expects the memory to have done it).
+    void ForceOutdated(const std::unique_lock<std::recursive_mutex>& global_lock);
 
     // For LRU caching - updates the last usage frame and moves the texture to
     // the end of the usage queue. Must be called any time the texture is
@@ -237,6 +272,11 @@ class TextureCache {
     void MarkAsUsed();
 
     void LogAction(const char* action) const;
+
+#if REX_PLATFORM_ANDROID
+    bool android_last_load_zero() const { return android_last_load_zero_; }
+    void set_android_last_load_zero(bool zero) { android_last_load_zero_ = zero; }
+#endif
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -269,11 +309,31 @@ class TextureCache {
     bool base_outdated_ = false;
     // Whether the recent mip data needs reloading from the memory.
     bool mips_outdated_ = false;
+    bool base_up_to_date_before_resolve_ = false;
     std::atomic<uint32_t> outdated_mask_{0};
     // Watch handles for the memory ranges.
     SharedMemory::WatchHandle base_watch_handle_ = nullptr;
     SharedMemory::WatchHandle mips_watch_handle_ = nullptr;
+#if REX_PLATFORM_ANDROID
+    bool android_last_load_zero_ = false;
+#endif
   };
+
+  // Marks every texture the predicate accepts as outdated (see Texture::ForceOutdated).
+  void MarkTexturesOutdated(const std::function<bool(Texture&)>& predicate);
+
+  // Visits the textures with the base level at the 4 KB physical page. The visitor must not create
+  // or destroy textures.
+  void ForEachTextureAtBasePage(uint32_t base_page, const std::function<void(Texture&)>& visit);
+  // A single-level texture with packed mips keeps its base level outside the mip tail unless it is
+  // 16 texels or smaller on a side.
+  static bool IsBaseInPackedMipTail(const TextureKey& key) {
+    return key.packed_mips && texture_util::GetPackedMipLevel(key.GetWidth(), key.GetHeight()) == 0;
+  }
+
+  // gpu_native_resolves: for a texture whose base level the host has just written with the data
+  // the guest memory now contains, marks it up to date and watches its memory again.
+  void MakeTextureUpToDateAndWatch(Texture& texture);
 
   // Rules of data access in load shaders:
   // - Source reading (from the shared memory or the scaled resolve buffer):
@@ -450,6 +510,11 @@ class TextureCache {
   static constexpr uint8_t kSwizzledSignsUnsigned =
       uint8_t(xenos::TextureSign::kUnsigned) * uint8_t(0b01010101);
 
+  // The host texture bound to a fetch constant by the last RequestTextures (nullptr if none).
+  Texture* GetActiveTexture(uint32_t fetch_constant_index) const {
+    return texture_bindings_[fetch_constant_index].texture;
+  }
+
   struct TextureBinding {
     TextureKey key;
     // Destination swizzle merged with guest to host format swizzle.
@@ -561,6 +626,11 @@ class TextureCache {
                           PendingSharedMemoryRange* pending_ranges_out,
                           size_t& pending_range_count_out);
   bool CommitPreparedTextureLoad(const PendingTextureLoad& pending_load);
+#if REX_PLATFORM_ANDROID
+  void RecordAndroidTextureLoad(Texture& texture, bool load_base, bool load_mips);
+  bool IsAndroidGuestRangeGpuWritten(uint32_t guest_address, uint32_t length) const;
+  bool IsAndroidGuestRangeZero(uint32_t guest_address, uint32_t length) const;
+#endif
 
   void UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t subtract);
 
@@ -604,6 +674,8 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
+  // The textures in textures_ by TextureKey::base_page.
+  std::unordered_multimap<uint32_t, Texture*> textures_by_base_page_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 
@@ -614,6 +686,13 @@ class TextureCache {
   // so need to recheck if textures aren't outdated, disregarding whether fetch
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
+
+#if REX_PLATFORM_ANDROID
+  bool android_texture_zero_check_ = false;
+  AndroidTextureLoadStats android_texture_load_stats_;
+  // Watch callbacks run on the guest threads that write the memory.
+  std::atomic<uint32_t> android_texture_invalidations_{0};
+#endif
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch

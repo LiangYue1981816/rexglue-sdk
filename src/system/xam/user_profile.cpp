@@ -15,11 +15,16 @@
 
 #include <rex/logging.h>
 #include <rex/system/kernel_state.h>
+#include <rex/system/system_link.h>
 #include <rex/system/xam/user_profile.h>
 
 namespace rex {
 namespace system {
 namespace xam {
+
+namespace {
+constexpr size_t kMaxGamertagLength = 15;
+}  // namespace
 
 UserProfile::UserProfile() {
   // 58410A1F checks the user XUID against a mask of 0x00C0000000000000 (3<<54),
@@ -27,6 +32,8 @@ UserProfile::UserProfile() {
   // "You do not have permissions to perform this operation."
   xuid_ = 0xB13EBABEBABEBABE;
   name_ = "User";
+  network_xuid_ = xuid_;
+  gamertag_ = name_;
 
   // https://cs.rin.ru/forum/viewtopic.php?f=38&t=60668&hilit=gfwl+live&start=195
   // https://github.com/arkem/py360/blob/master/py360/constants.py
@@ -93,6 +100,25 @@ UserProfile::UserProfile() {
   AddSetting(std::make_unique<BinarySetting>(0x63E83FFD));
 }
 
+UserProfile::UserProfile(const UserProfile& primary, uint32_t user_index) : UserProfile() {
+  // Adding the index keeps bits 54-55 (the forbidden bits) clear, and keeps the offline/online
+  // type bits of the primary profile. Each player gets distinct XUIDs, so title settings and
+  // content for them are stored apart.
+  xuid_ = primary.xuid_ + user_index;
+  network_xuid_ = primary.network_xuid_ + user_index;
+  name_ = fmt::format("{} {}", primary.name_, user_index + 1);
+  // Truncate the base name, not the suffix, so the index survives and the gamertag stays distinct.
+  auto suffix = fmt::format(" {}", user_index + 1);
+  gamertag_ = primary.gamertag_.substr(0, kMaxGamertagLength - suffix.size()) + suffix;
+}
+
+void UserProfile::LoadNetworkIdentity(const std::filesystem::path& user_data_root) {
+  network_xuid_ = system_link::ResolveXuid(user_data_root);
+  gamertag_ = system_link::Gamertag();
+  REXLOG_INFO("Signed-in player: XUID {}, gamertag '{}'", system_link::FormatXuid(network_xuid_),
+              gamertag_);
+}
+
 void UserProfile::AddSetting(std::unique_ptr<Setting> setting) {
   Setting* previous_setting = setting.get();
   std::swap(settings_[setting->setting_id], previous_setting);
@@ -133,7 +159,7 @@ UserProfile::Setting* UserProfile::GetSetting(uint32_t setting_id) {
 
 void UserProfile::LoadSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(name_);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;
     auto file = rex::filesystem::OpenFile(file_path, "rb");
@@ -158,7 +184,7 @@ void UserProfile::LoadSetting(UserProfile::Setting* setting) {
 void UserProfile::SaveSetting(UserProfile::Setting* setting) {
   if (setting->is_title_specific()) {
     auto serialized_setting = setting->Serialize();
-    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+    auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath(name_);
     std::filesystem::create_directories(content_dir);
     auto setting_id = fmt::format("{:08X}", setting->setting_id);
     auto file_path = content_dir / setting_id;

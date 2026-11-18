@@ -54,6 +54,7 @@ if(REXGLUE_USE_D3D12)
     set(REXUI_D3D12_SOURCES
         d3d12/d3d12_cpu_descriptor_pool.cpp
         d3d12/d3d12_descriptor_heap_pool.cpp
+        d3d12/d3d12_hdr.cpp
         d3d12/d3d12_immediate_drawer.cpp
         d3d12/d3d12_presenter.cpp
         d3d12/d3d12_provider.cpp
@@ -71,6 +72,12 @@ if(WIN32)
 elseif(APPLE)
     set(REXUI_PLATFORM_SOURCES
         surface_mac.cpp
+    )
+elseif(ANDROID)
+    # Android uses SDL3's Android support plus an ANativeWindow surface; the
+    # desktop-Linux X11/Wayland surface code does not apply.
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
     )
 else()
     set(REXUI_PLATFORM_SOURCES
@@ -124,6 +131,14 @@ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sd
     target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
 endif()
 
+if(ANDROID)
+    # FSR 1 / CAS SPIR-V is in-tree; Android fetches no FidelityFX SDK and has no temporal runtime.
+    get_target_property(REXUI_COMPILE_DEFINITIONS rexui COMPILE_DEFINITIONS)
+    if(NOT "REX_HAS_FIDELITYFX_SDK=1" IN_LIST REXUI_COMPILE_DEFINITIONS)
+        target_compile_definitions(rexui PRIVATE REX_HAS_FIDELITYFX_SDK=1)
+    endif()
+endif()
+
 set(REXUI_HAS_FIDELITYFX_RUNTIME OFF)
 if(TARGET amd_fidelityfx_vk)
     target_link_libraries(rexui PRIVATE amd_fidelityfx_vk)
@@ -143,10 +158,18 @@ if(REXGLUE_USE_VULKAN)
         GPUOpen::VulkanMemoryAllocator
         spirv-tools-headers
     )
+    if(ANDROID)
+        # Vulkan comes from the NDK's system libvulkan; the third-party
+        # vulkan-loader is not built on Android.
+        target_link_libraries(rexui PUBLIC vulkan android)
+    endif()
 endif()
 
 # Platform-specific dependencies
-if(UNIX AND NOT APPLE)
+# Desktop Linux only: on Android SDL3 provides windowing, input and audio
+# through its own Android backend, and there are no X11/Wayland system
+# libraries to discover via pkg-config.
+if(UNIX AND NOT APPLE AND NOT ANDROID)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
@@ -166,7 +189,7 @@ elseif(APPLE)
 endif()
 
 if(WIN32)
-    target_link_libraries(rexui PUBLIC dxgi dxguid)
+    target_link_libraries(rexui PUBLIC dxgi dxguid windowscodecs shell32 ole32)
 endif()
 
 # D3D12 backend dependencies

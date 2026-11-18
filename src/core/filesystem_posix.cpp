@@ -10,6 +10,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -100,6 +101,13 @@ std::filesystem::path GetExecutablePath() {
 }
 
 std::filesystem::path GetExecutableFolder() {
+#if REX_PLATFORM_ANDROID
+  // An app's process image is /system/bin/app_process64; the activity names the folder that
+  // holds its config and logs instead.
+  if (auto dir = rex::platform::env::get("REX_EXECUTABLE_FOLDER")) {
+    return std::filesystem::path(*dir);
+  }
+#endif
   return GetExecutablePath().parent_path();
 }
 
@@ -123,8 +131,22 @@ std::filesystem::path GetUserFolder() {
   return std::filesystem::path(pw->pw_dir) / ".local" / "share";
 }
 
+#if REX_PLATFORM_ANDROID
+static bool IsAppendReadMode(const std::string_view mode) {
+  return mode.find('a') != std::string_view::npos && mode.find('+') != std::string_view::npos;
+}
+#endif
+
 FILE* OpenFile(const std::filesystem::path& path, const std::string_view mode) {
-  return fopen(path.c_str(), std::string(mode).c_str());
+  FILE* file = fopen(path.c_str(), std::string(mode).c_str());
+#if REX_PLATFORM_ANDROID
+  // Bionic starts an "a+" stream's reads at the end of the file (glibc and MSVC at 0), so the
+  // shader storage readers saw no header and truncated their files on every launch.
+  if (file && IsAppendReadMode(mode)) {
+    rewind(file);
+  }
+#endif
+  return file;
 }
 
 bool Seek(FILE* file, int64_t offset, int origin) {
@@ -301,6 +323,33 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
   closedir(dir);
   return result;
 }
+
+#if defined(__ANDROID__)
+// Android content-URI helpers declared in rex/filesystem.h. There is no JNI
+// ContentResolver bridge wired up yet, so opening a content:// URI cannot
+// produce a file descriptor: report "not a content URI" correctly and fail
+// the open (callers treat fd < 0 as failure). The no-op lifecycle functions
+// satisfy the declared API. Android-only so desktop builds are unchanged.
+void AndroidInitialize() {}
+
+void AndroidShutdown() {}
+
+bool IsAndroidContentUri(const std::string_view source) {
+  constexpr std::string_view kContentScheme = "content://";
+  return source.size() >= kContentScheme.size() &&
+         source.compare(0, kContentScheme.size(), kContentScheme) == 0;
+}
+
+int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
+  (void)uri;
+  (void)mode;
+  // No JNI ContentResolver bridge in this step: content:// URIs are not
+  // supported yet. Fail like open(2) with errno set; callers treat fd < 0
+  // as failure.
+  errno = ENOSYS;
+  return -1;
+}
+#endif  // defined(__ANDROID__)
 
 }  // namespace filesystem
 }  // namespace rex

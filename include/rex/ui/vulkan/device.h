@@ -110,6 +110,7 @@ class VulkanDevice {
     bool shaderCullDistance = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;
+    bool shaderStorageImageExtendedFormats = false;
 
     // VK_KHR_sampler_mirror_clamp_to_edge (#15, promoted to 1.2)
 
@@ -210,6 +211,9 @@ class VulkanDevice {
 #define XE_UI_VULKAN_FUNCTION_PROMOTED(extension_name, core_name) \
   PFN_##core_name core_name = nullptr;
 #include <rex/ui/vulkan/functions/device_1_0.inc>
+#if REX_PLATFORM_ANDROID
+#include <rex/ui/vulkan/functions/device_1_0_pipeline_cache.inc>
+#endif
     // VK_KHR_swapchain (#2)
 #include <rex/ui/vulkan/functions/device_khr_swapchain.inc>
     // VK_KHR_get_memory_requirements2 (#147, promoted to 1.1)
