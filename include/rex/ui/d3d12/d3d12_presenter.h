@@ -343,6 +343,7 @@ class D3D12Presenter final : public Presenter {
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
   std::atomic<bool> screenshot_requested_ = false;
+  int32_t present_screenshot_request_seen_ = 0;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;

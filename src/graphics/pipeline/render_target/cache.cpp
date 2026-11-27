@@ -44,8 +44,9 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
 
 REXCVAR_DEFINE_BOOL(gpu_native_surfaces, false, "GPU",
                     "Native renderer, phase 2a: render targets are host surfaces; EDRAM ownership "
-                    "copies between them are dropped (depth to depth kept) and counted; forces "
-                    "host render targets and draws Direct3D's 4x clears at 1x")
+                    "copies between them are dropped (depth to depth and depth to and from k_16_16 "
+                    "colour kept) and counted; forces host render targets and draws Direct3D's "
+                    "4x clears at 1x")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 REXCVAR_DEFINE_BOOL(gpu_native_resolves, false, "GPU",
@@ -60,6 +61,11 @@ REXCVAR_DEFINE_BOOL(gpu_native_hook_example, false, "GPU",
                     "exponent bias) before the game samples it, to show where effects can be "
                     "inserted; needs gpu_native_resolves")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(gpu_native_keep_transfers, "default", "GPU",
+                      "Native surfaces debug: which EDRAM ownership transfers survive. "
+                      "default, all, none, or a list like 'C>D, D3>C6, default' (C/D = "
+                      "colour/depth, optional resource format, * = any)");
 
 namespace rex::graphics {
 
@@ -1495,10 +1501,19 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
 void RenderTargetCache::DropNativeSurfaceTransfers(std::vector<Transfer>& transfers,
                                                    const RenderTargetKey& dest_key) {
   const native_surfaces::SurfaceKind dest_kind = KindOf(dest_key);
+  const std::string& text = REXCVAR_GET(gpu_native_keep_transfers);
+  if (text != native_keep_transfers_text_) {
+    native_keep_transfers_text_ = text;
+    native_keep_transfers_policy_ = native_surfaces::ParseTransferPolicy(text);
+    const native_surfaces::TransferPolicy& policy = native_keep_transfers_policy_;
+    REXGPU_INFO("NATIVESURF keep transfers: '{}'{}", text,
+                policy.use_default && policy.rules.empty() ? " (built-in policy)" : "");
+  }
+  const native_surfaces::TransferPolicy& policy = native_keep_transfers_policy_;
   auto dropped_begin =
       std::remove_if(transfers.begin(), transfers.end(), [&](const Transfer& transfer) {
         const native_surfaces::SurfaceKind source_kind = KindOf(transfer.source->key());
-        if (native_surfaces::KeepTransfer(source_kind, dest_kind)) {
+        if (native_surfaces::KeepTransferWithPolicy(policy, source_kind, dest_kind)) {
           return false;
         }
         native_surface_drops_.Record(source_kind, dest_kind,

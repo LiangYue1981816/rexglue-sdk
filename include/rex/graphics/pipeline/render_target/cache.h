@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -733,6 +734,8 @@ class RenderTargetCache {
 
   // gpu_native_surfaces: ownership transfers dropped since the last report.
   native_surfaces::DropCounters native_surface_drops_;
+  std::string native_keep_transfers_text_;
+  native_surfaces::TransferPolicy native_keep_transfers_policy_;
   // gpu_native_surfaces: transfers dropped by DropNativeWideTransfers, and resolve dump spans
   // clamped to xenos::kEdramTileCount tiles (per GetResolveCopyRectanglesToDump call), since the
   // last report.

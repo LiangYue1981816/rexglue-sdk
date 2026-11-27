@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <map>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -21,13 +22,172 @@ struct SurfaceKind {
 constexpr uint32_t kColorFormat16_16 = 4;
 
 // Which EDRAM ownership copies survive in the native surfaces mode: depth to depth (the game reads
-// depth back across the two depth formats at the same EDRAM base), and k_16_16 colour to depth (at
-// 21:9 the light shafts read a depth surface the game first wrote as a k_16_16 colour target).
+// depth back across the two depth formats at the same EDRAM base), and depth to and from k_16_16
+// colour: the game reads depth through a k_16_16 view of the same EDRAM (the 21:9 light shafts
+// read a depth surface it first wrote as k_16_16, and without depth to k_16_16 the motion blur
+// smears objects that move with the camera, issue #26).
 inline bool KeepTransfer(const SurfaceKind& source, const SurfaceKind& dest) {
-  if (!dest.is_depth) {
+  if (source.is_depth && dest.is_depth) {
+    return true;
+  }
+  if (!source.is_depth && source.format == kColorFormat16_16 && dest.is_depth) {
+    return true;
+  }
+  if (source.is_depth && !dest.is_depth && dest.format == kColorFormat16_16) {
+    return true;
+  }
+  return false;
+}
+
+struct TransferSide {
+  bool any_kind;
+  bool is_depth;
+  bool any_format;
+  uint32_t format;
+};
+
+struct TransferRule {
+  TransferSide source;
+  TransferSide dest;
+};
+
+struct TransferPolicy {
+  bool use_default = true;
+  std::vector<TransferRule> rules;
+};
+
+inline bool TransferSideMatches(const TransferSide& side, const SurfaceKind& kind) {
+  if (side.any_kind) {
+    return true;
+  }
+  return side.is_depth == kind.is_depth &&
+         (side.any_format || side.format == kind.format);
+}
+
+inline bool KeepTransferWithPolicy(const TransferPolicy& policy, const SurfaceKind& source,
+                                   const SurfaceKind& dest) {
+  if (policy.use_default && KeepTransfer(source, dest)) {
+    return true;
+  }
+  for (const TransferRule& rule : policy.rules) {
+    if (TransferSideMatches(rule.source, source) && TransferSideMatches(rule.dest, dest)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool IsTransferSeparator(char c) {
+  return c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' ||
+         c == '\v';
+}
+
+inline bool ParseTransferSide(std::string_view text, TransferSide& side_out) {
+  if (text == "*") {
+    side_out = TransferSide{true, false, true, 0};
+    return true;
+  }
+  if (text.empty()) {
     return false;
   }
-  return source.is_depth || source.format == kColorFormat16_16;
+  bool is_depth;
+  char head = text[0];
+  if (head == 'C' || head == 'c') {
+    is_depth = false;
+  } else if (head == 'D' || head == 'd') {
+    is_depth = true;
+  } else {
+    return false;
+  }
+  if (text.size() == 1) {
+    side_out = TransferSide{false, is_depth, true, 0};
+    return true;
+  }
+  uint32_t format = 0;
+  for (size_t i = 1; i < text.size(); ++i) {
+    char c = text[i];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    format = format * 10 + uint32_t(c - '0');
+    if (format > 63) {
+      return false;
+    }
+  }
+  side_out = TransferSide{false, is_depth, false, format};
+  return true;
+}
+
+inline bool ParseTransferToken(std::string_view token, TransferRule& rule_out) {
+  size_t sep = token.find('>');
+  if (sep == std::string_view::npos) {
+    return false;
+  }
+  if (token.find('>', sep + 1) != std::string_view::npos) {
+    return false;
+  }
+  TransferSide source{false, false, true, 0};
+  TransferSide dest{false, false, true, 0};
+  if (!ParseTransferSide(token.substr(0, sep), source)) {
+    return false;
+  }
+  if (!ParseTransferSide(token.substr(sep + 1), dest)) {
+    return false;
+  }
+  rule_out = TransferRule{source, dest};
+  return true;
+}
+
+inline TransferPolicy ParseTransferPolicy(std::string_view text) {
+  std::vector<std::string_view> tokens;
+  size_t i = 0;
+  while (i < text.size()) {
+    while (i < text.size() && IsTransferSeparator(text[i])) {
+      ++i;
+    }
+    if (i >= text.size()) {
+      break;
+    }
+    size_t start = i;
+    while (i < text.size() && !IsTransferSeparator(text[i])) {
+      ++i;
+    }
+    tokens.push_back(text.substr(start, i - start));
+  }
+  if (tokens.empty()) {
+    return TransferPolicy{};
+  }
+  if (tokens.size() == 1) {
+    if (tokens[0] == "default") {
+      return TransferPolicy{};
+    }
+    if (tokens[0] == "all") {
+      TransferPolicy policy;
+      policy.use_default = false;
+      TransferSide any{true, false, true, 0};
+      policy.rules.push_back(TransferRule{any, any});
+      return policy;
+    }
+    if (tokens[0] == "none") {
+      TransferPolicy policy;
+      policy.use_default = false;
+      return policy;
+    }
+  }
+  TransferPolicy policy;
+  policy.use_default = false;
+  for (std::string_view token : tokens) {
+    if (token == "default") {
+      policy.use_default = true;
+      continue;
+    }
+    TransferRule rule{{false, false, true, 0}, {false, false, true, 0}};
+    if (!ParseTransferToken(token, rule)) {
+      return TransferPolicy{};
+    }
+    policy.rules.push_back(rule);
+  }
+  return policy;
 }
 
 class DropCounters {

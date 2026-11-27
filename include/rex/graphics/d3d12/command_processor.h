@@ -332,7 +332,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
   // the submission to await to simply check status, or pass submission_current_
   // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  bool CheckSubmissionFence(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -348,8 +348,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
+    return CheckSubmissionFence(submission_current_) &&
+           (!submission_current_ || submission_completed_ >= submission_current_ - 1);
   }
   void LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason);
 

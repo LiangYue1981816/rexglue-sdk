@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -99,12 +100,25 @@ class TextureReplacementManager {
                          const ReplacementImage& image);
 
  private:
+  void PrepareHistoryCache();
+  void LogPrecacheStats();
   void ResolveDirs();
   void ScanReplaceDir();
   void ScanDir(const std::filesystem::path& dir,
                std::unordered_map<uint64_t, std::filesystem::path>* out);
   void Refuse(uint64_t hash, const std::string& reason);
 
+  struct PreparedImage {
+    ReplacementImage image;
+    uint64_t file_size = 0;
+    std::filesystem::file_time_type mtime{};
+  };
+  std::unordered_map<uint64_t, PreparedImage> prepared_images_;
+  uint64_t precache_hits_ = 0, precache_cold_reads_ = 0;
+  uint64_t precache_prepared_count_ = 0, precache_pending_bytes_ = 0;
+  uint64_t precache_last_report_hits_ = 0, precache_last_report_cold_ = 0;
+  bool precache_enabled_ = false;
+  std::chrono::steady_clock::time_point precache_last_report_{};
   uint32_t title_id_ = 0;
   std::filesystem::path pack_dir_;
   std::filesystem::path dump_dir_;

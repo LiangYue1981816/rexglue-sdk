@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/input/mnk/mnk_input_driver.h>
+#include "gow2_menu_escape_back.h"
 
 #include <rex/cvar.h>
 #include <rex/input/input.h>
@@ -25,6 +26,8 @@
 #include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
+REXCVAR_DEFINE_BOOL(gow2_menu_escape_back, true, "Input",
+                    "GoW2: Escape sends B in menus while native gameplay keeps Escape for pause.");
 REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
                     "Use the mouse for the right stick. Off means the right stick comes "
                     "from the keybind_rstick_* keys only");
@@ -315,6 +318,11 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
   if (IsBindPressed(kd, REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+
+  buttons = gow2_menu_escape::Route(
+      buttons, REXCVAR_GET(gow2_menu_escape_back), rex::cvar::Query<bool>("gow2_native_keys"),
+      REXCVAR_GET(mnk_keys), kd[static_cast<unsigned short>(rex::ui::VirtualKey::kEscape)],
+      X_INPUT_GAMEPAD_START, X_INPUT_GAMEPAD_B);
 
   uint8_t lt = IsBindPressed(kd, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
   uint8_t rt = IsBindPressed(kd, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;

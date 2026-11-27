@@ -47,6 +47,9 @@
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
+REXCVAR_DEFINE_INT32(present_screenshot_request, 0, "Display",
+                      "Test hook: each change of this value saves one screenshot, like F12");
+
 REXCVAR_DECLARE(bool, present_hdr);
 REXCVAR_DECLARE(int32_t, present_hdr_paper_white_nits);
 REXCVAR_DECLARE(int32_t, present_hdr_peak_nits);
@@ -1465,6 +1468,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     back_buffer_clear_needed = false;
   }
 
+  if (REXCVAR_GET(present_screenshot_request) != present_screenshot_request_seen_) {
+    present_screenshot_request_seen_ = REXCVAR_GET(present_screenshot_request);
+    screenshot_requested_.store(true, std::memory_order_release);
+  }
   if (screenshot_requested_.exchange(false, std::memory_order_acq_rel)) {
     D3D12_RESOURCE_DESC desc = back_buffer->GetDesc();
     screenshot_width = uint32_t(desc.Width);
