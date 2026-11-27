@@ -1,6 +1,6 @@
 # 本 SDK 树已应用的补丁
 
-本树 = ReXGlue 提交 `923c1a5` + 《战争机器 2》重编译项目 `sdk/patches/` 的**全套 87 个补丁**，
+本树 = ReXGlue 提交 `923c1a5` + 《战争机器 2》重编译项目 `sdk/patches/` 的**全套 95 个补丁**，
 按文件名顺序应用。该项目的 `scripts/build-sdk.ps1`（Windows）与 `scripts/build-android.ps1`
 （Android）也是拿同一套补丁序列从干净 checkout 编出来的，因此本树的代码与它发布的构建一致。
 
@@ -8,10 +8,12 @@
 |---|---|
 | 基线提交 | `923c1a5` — feat(ui): apply the monitor, window size and fullscreen mode without a restart |
 | 补丁来源 | `santiquiroz/gears-of-war-2-pc-port` → `sdk/patches/` |
-| 补丁作者 | Santiago Quiroz Upegui（全部；其中 2 条为移植，见下表「来源」列） |
-| 补丁数量 | **87**（`0002` … `0091`） |
-| 最后同步 | 2026-11-18 |
-| 应用情况 | 87 条全部应用，无跳过 |
+| 补丁作者 | Santiago Quiroz Upegui（主体；移植与外部贡献见下表「来源」列） |
+| 补丁数量 | **95**（`0002` … `0100`，无 `0008` `0009` `0064` `0098`） |
+| 最后同步 | 2026-11-27（补到 `0100`） |
+| 应用情况 | 95 条全部应用，无跳过 |
+
+本树里带 `gow2` 前缀的文件名、cvar、环境变量与宏另有清单，见 [GoW2_PATCHS.md](GoW2_PATCHS.md)。
 
 上游的序列是**只追加**的：已存在的编号文件不会被重写，新能力以更大的编号追加。所以同步
 永远只做「加文件」，不会改动本树已应用的条目。
@@ -19,13 +21,17 @@
 ## 上游出新补丁时怎么跟
 
 1. 更新补丁来源（`git -C <GoW2 仓库> pull`，或直接取上面的地址）。
-2. 列出它的 `sdk/patches/*.patch`。**编号大于 `0091` 且不在下表里的，就是新增的。**
+2. 列出它的 `sdk/patches/*.patch`。**编号大于 `0100` 且不在下表里的，就是新增的。**
 3. 逐条应用到本树，编号从小到大：`git apply --whitespace=nowarn <文件>`。
    任一条失败就停下并重读那条补丁——失败意味着本树上下文已与上游不同，不是"可选"。
 4. 把新增的行追加到下表，并更新表格上方的「补丁数量」与「最后同步」。
 
-**不要在本树上整套重放**：87 条都已在内，且它们彼此累积（后一条的上下文包含前一条的改动）。
+**不要在本树上整套重放**：95 条都已在内，且它们彼此累积（后一条的上下文包含前一条的改动）。
 整套重放必须先回到干净的 `923c1a5`，再按序应用。
+
+**按序应用，不能并行 check**：`0095` 与 `0094` 改的是 `native_surfaces.h` 同一段，`0095` 的 diff
+基于 `0094` 之后的状态。单独 `git apply --check 0095-*.patch` 会报 "patch does not apply"，那是
+顺序问题，不是冲突——先 `0094` 再 `0095` 就干净。同理，任何新补丁都要按文件名序逐条落地。
 
 ## 与上游的唯一差异
 
@@ -41,8 +47,12 @@
 
 | 目标 | 结果 | 产物 |
 |---|---|---|
-| Windows x64 (Release) | 通过 | `out/win-amd64/Release/rexglue.exe`、`rexruntime.dll`、`rexgpu-xenos.dll` |
-| Android arm64（arm64-v8a / API 29 / NDK r29） | 通过 | `out/android-arm64/librexruntime.so`、`librexgpu-xenos.so`、`libSDL3.so`、`libc++_shared.so` |
+| Windows x64 (Release) | 通过（`0002`–`0091`） | `out/win-amd64/Release/rexglue.exe`、`rexruntime.dll`、`rexgpu-xenos.dll` |
+| Android arm64（arm64-v8a / API 29 / NDK r29） | 通过（`0002`–`0091`） | `out/android-arm64/librexruntime.so`、`librexgpu-xenos.so`、`libSDL3.so`、`libc++_shared.so` |
+
+**`0092`–`0100` 应用后尚未重新验证编译**（2026-11-27）。这段是 13 个文件改动 + 3 个纯新增头文件
+（`gow2_fence_wait.h`、`gow2_precache_plan.h`、`gow2_menu_escape_back.h`），都不需要改 CMake 源列表；
+`0096`/`0097` 的 cvar 由 SDK 自行注册，不依赖游戏侧定义。
 
 两端都由仓库根目录的 `build-rexglue-sdk.ps1` 产出；不带参数即两端都编，`-SkipWindows` /
 `-SkipAndroid` 只编单端。Android 的 `libc++_shared.so` 由脚本从 NDK sysroot 拷到产物目录。
@@ -54,15 +64,15 @@ Android 三个 `.so` 的 `NEEDED` 只有 `libSDL3.so`、`libc++_shared.so` 与�
 
 | 领域 | 补丁 |
 |---|---|
-| 超分与插帧（5） | `0002` `0030` `0069` `0072` `0074` |
+| 超分与插帧（6） | `0002` `0030` `0069` `0072` `0074` `0093` |
 | System Link / 联机（4） | `0003` `0010` `0011` `0012` |
-| 材质包（3） | `0004` `0023` `0073` |
-| 输入（8） | `0005` `0006` `0022` `0029` `0046` `0048` `0060` `0061` |
-| Android / Linux / POSIX 平台（14） | `0007` `0052` `0053` `0055` `0075` `0076` `0078` `0079` `0080` `0081` `0083` `0084` `0085` `0086` |
+| 材质包（4） | `0004` `0023` `0073` `0096` |
+| 输入（9） | `0005` `0006` `0022` `0029` `0046` `0048` `0060` `0061` `0097` |
+| Android / Linux / POSIX 平台（15） | `0007` `0052` `0053` `0055` `0075` `0076` `0078` `0079` `0080` `0081` `0083` `0084` `0085` `0086` `0092` |
 | XAM / 宿主 UI（4） | `0013` `0047` `0049` `0050` |
-| D3D12 专有（9） | `0017` `0021` `0024` `0025` `0026` `0027` `0051` `0071` `0090` |
-| Native renderer（16） | `0032` `0036`–`0045` `0056` `0057` `0058` `0066` `0067` |
-| Vulkan / GPU 通用（10） | `0016` `0018` `0019` `0020` `0028` `0062` `0063` `0082` `0089` `0091` |
+| D3D12 专有（10） | `0017` `0021` `0024` `0025` `0026` `0027` `0051` `0071` `0090` `0099` |
+| Native renderer（18） | `0032` `0036`–`0045` `0056` `0057` `0058` `0066` `0067` `0094` `0095` |
+| Vulkan / GPU 通用（11） | `0016` `0018` `0019` `0020` `0028` `0062` `0063` `0082` `0089` `0091` `0100` |
 | 运行时 / 图形通用（14） | `0014` `0015` `0031` `0033` `0034` `0035` `0054` `0059` `0065` `0068` `0070` `0077` `0087` `0088` |
 
 ## 逐条清单
@@ -158,3 +168,13 @@ Android 三个 `.so` 的 `NEEDED` 只有 `libSDL3.so`、`libc++_shared.so` 与�
 | 85 | `0089-vulkan-tight-render-area.patch` | 作者自写 | Vulkan (Android, Linux, and Windows with `gpu_backend = vulkan`): each render pass begins with a render area that covers only what it can write, the union of the… |
 | 86 | `0090-fidelityfx-deadlock-and-context-retirement.patch` | 作者自写 | Windows (D3D12 with FidelityFX): fixes two crashes with FSR and frame generation. First, `FrameGeneration::Dispatch` no longer locks `mutex_`. The FidelityFX frame… |
 | 87 | `0091-vulkan-tessellation.patch` | 作者自写 | Vulkan (Linux, Proton with `gpu_backend = vulkan`, Windows with `gpu_backend = vulkan`): the tessellated draws (the Riftworm's flesh in act 5, quad patches with… |
+| 88 | `0092-android-stereo-fold.patch` | 作者自写 | Android: the SDL audio driver folds the guest 5.1 mix to stereo itself (ITU-R BS.775 `StereoFold` weights) instead of submitting 6 channels. Android's default playback… |
+| 89 | `0093-drop-duplicate-render-scale-cvar.patch` | 作者自写 | Removes the SDK's `gow2_render_scale` (a double from 0002 that nothing read). The game defines its own since 0.4.7, and the second registration of the same name was… |
+| 90 | `0094-native-transfer-policy-and-screenshot-request.patch` | 作者自写 | Two live debug knobs. `gpu_native_keep_transfers` (string, `default`) chooses which EDRAM ownership transfers survive in native surfaces mode (`all`, `none`, or a… |
+| 91 | `0095-native-keep-depth-to-16-16.patch` | 作者自写 | Native surfaces keep the EDRAM ownership transfers from depth to `k_16_16` colour too (issue #26: motion blur smeared objects that move with the camera). Found with… |
+| 92 | `0096-adaptive-texture-precache.patch` | 作者自写 | Opt-in bounded history-based D3D12 replacement-texture preload, source revalidation and on-demand fallback. See `docs/TEXTURE_PRECACHE.md`. |
+| 93 | `0097-menu-escape-back.patch` | optimistic-blip（PR #59） | Escape works as B (back) in menus and the pause menu while the keyboard drives the emulated pad; during gameplay Escape stays pause. `gow2_menu_escape_back`… |
+| 94 | `0099-d3d12-fence-failure-handling.patch` | 作者自写 | Reject removed-device fence sentinel before reclamation; check Signal/event/wait results and propagate failure to draw/readback callers. |
+| 95 | `0100-vulkan-storage-buffer-range-clamp.patch` | 作者自写 | Debug cvar `vulkan_max_storage_buffer_range_mb` (0 = off): lowers the device's `maxStorageBufferRange` so a PC GPU takes the four-binding shared memory path that… |
+
+`0098` 号不存在，上游跳号；`0008` `0009` `0064` 同样从未出现。
